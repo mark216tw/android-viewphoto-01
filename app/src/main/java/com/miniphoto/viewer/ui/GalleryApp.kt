@@ -54,6 +54,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
+import androidx.compose.material3.NavigationBarItemDefaults
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
@@ -73,6 +74,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import coil.compose.AsyncImage
 import com.miniphoto.viewer.DisplayMode
@@ -189,6 +191,16 @@ fun GalleryApp(
         }
     }
 
+    val returnToFolderList = {
+        gallerySection = GallerySection.FOLDERS
+        selectedBucketId = null
+    }
+    BackHandler(
+        enabled = screen == Screen.Gallery &&
+            gallerySection == GallerySection.FOLDERS &&
+            selectedBucketId != null,
+        onBack = returnToFolderList,
+    )
     BackHandler(screen != Screen.Gallery) {
         screen = when (val current = screen) {
             is Screen.Editor -> when {
@@ -232,10 +244,7 @@ fun GalleryApp(
                     gallerySection = GallerySection.FOLDERS
                     selectedBucketId = bucketId
                 },
-                onFolderBack = {
-                    gallerySection = GallerySection.FOLDERS
-                    selectedBucketId = null
-                },
+                onFolderBack = returnToFolderList,
                 openPhoto = { photo, bucketId ->
                     viewerPosition = ViewerPosition(photo.id, PhotoViewport())
                     screen = Screen.Viewer(photo.id, bucketId)
@@ -379,6 +388,13 @@ private fun GalleryScreen(
     val visiblePhotos = remember(state.photos, selectedBucketId) {
         state.photos.filter { selectedBucketId == null || it.bucketId == selectedBucketId }
     }
+    val navigationItemColors = NavigationBarItemDefaults.colors(
+        selectedIconColor = MaterialTheme.colorScheme.onSecondary,
+        selectedTextColor = MaterialTheme.colorScheme.secondary,
+        indicatorColor = MaterialTheme.colorScheme.secondary,
+        unselectedIconColor = MaterialTheme.colorScheme.onSurfaceVariant,
+        unselectedTextColor = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
     Scaffold(
         topBar = {
             TopAppBar(
@@ -423,13 +439,25 @@ private fun GalleryScreen(
                     selected = section == GallerySection.PHOTOS,
                     onClick = { onSectionSelected(GallerySection.PHOTOS) },
                     icon = { Icon(Icons.Rounded.Image, contentDescription = null) },
-                    label = { Text("相片") },
+                    label = {
+                        Text(
+                            text = "相片",
+                            fontWeight = if (section == GallerySection.PHOTOS) FontWeight.Bold else FontWeight.Normal,
+                        )
+                    },
+                    colors = navigationItemColors,
                 )
                 NavigationBarItem(
                     selected = section == GallerySection.FOLDERS,
                     onClick = { onSectionSelected(GallerySection.FOLDERS) },
                     icon = { Icon(Icons.Rounded.Folder, contentDescription = null) },
-                    label = { Text("資料夾") },
+                    label = {
+                        Text(
+                            text = "資料夾",
+                            fontWeight = if (section == GallerySection.FOLDERS) FontWeight.Bold else FontWeight.Normal,
+                        )
+                    },
+                    colors = navigationItemColors,
                 )
             }
         },
