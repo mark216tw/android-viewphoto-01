@@ -44,6 +44,7 @@ flowchart TD
 `MainViewModel` 管理：
 
 - `GalleryUiState`：圖片清單、載入及錯誤狀態。
+- `GalleryUiState`：圖片分頁、載入更多、錯誤與 MediaStore 變更狀態。
 - 外部圖片開啟要求與 `VIEW`／`EDIT` 模式。
 - 顯示模式，並透過 SharedPreferences 保存。
 
@@ -52,8 +53,10 @@ flowchart TD
 `PhotoRepository` 封裝：
 
 - MediaStore 圖片查詢及排序。
+- MediaStore 分頁查詢、穩定日期排序與 ContentObserver 刷新。
 - 外部 `content://` URI 中繼資料解析。
 - JPEG 輸出至公開 Pictures 目錄。
+- 依 Bitmap alpha 狀態輸出 PNG 或 JPEG。
 - 分享暫存檔與 FileProvider URI。
 
 ### UI 層
@@ -61,6 +64,7 @@ flowchart TD
 - `GalleryApp`：以 sealed `Screen` 管理 Gallery、Settings、Viewer 與 Editor。
 - `ZoomablePhoto`：處理雙擊、雙指縮放、拖曳與 Viewport 轉換。
 - `PhotoEditorScreen`：管理 Bitmap、向量筆畫、裁切區域、工具狀態與匯出。
+- `PhotoEditorViewModel`：保存編輯筆畫、復原／重做、裁切與 dirty state。
 - `Theme.kt`：Material 3 色彩與深淺主題。
 
 ## 資料模型
@@ -79,11 +83,11 @@ flowchart TD
 
 ## 圖片編輯管線
 
-1. `ImageDecoder` 或 `BitmapFactory` 載入 Bitmap，長邊超過 4096 時取樣。
+1. `ImageDecoder` 或 `BitmapFactory` 載入 Bitmap，長邊超過 4096 時取樣；API 26、27 另套用 EXIF orientation。
 2. 使用正規化座標保存筆畫，畫面預覽依目前圖片 bounds 即時繪製。
 3. 旋轉與水平翻轉會同步轉換 Bitmap 與筆畫座標，保留復原歷史。
 4. 裁切會先合併效果，再對 Bitmap 裁切並重設筆畫歷史。
-5. 匯出時在 Bitmap 副本套用模糊與標註圖層，壓縮為 JPEG 品質 95。
+5. 匯出時在 Bitmap 副本套用模糊與標註圖層；含透明度時輸出 PNG，否則輸出 JPEG 品質 95。
 
 ## 權限與版本差異
 
@@ -97,6 +101,6 @@ flowchart TD
 ## 已知技術限制
 
 - 裁切屬於破壞式編輯，套用後無法逐筆復原先前筆畫。
-- 輸出固定為 JPEG，透明度與來源格式不會保留。
-- 目前沒有自動化單元測試或 UI 測試，發行前應執行實機回歸測試。
+- 編輯狀態可跨組態變更保存；程序被系統完全終止後不保證恢復完整筆畫。
+- 目前已有圖片排序、編輯狀態、刪除位置與縮放計算單元測試，仍應執行實機回歸測試。
 - UI 文字目前直接寫在 Compose 程式碼中，尚未抽離為多語系資源。

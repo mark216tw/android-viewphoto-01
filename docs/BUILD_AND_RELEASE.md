@@ -48,7 +48,7 @@ apksigner verify --verbose --print-certs app/build/outputs/apk/prerelease/app-pr
 ## 品質檢查
 
 ```powershell
-.\gradlew.bat lintDebug lintPrerelease
+.\gradlew.bat testDebugUnitTest lintDebug lintPrerelease
 ```
 
 建議發行前至少驗證：
@@ -59,6 +59,8 @@ apksigner verify --verbose --print-certs app/build/outputs/apk/prerelease/app-pr
 4. 所有編輯工具、復原、重做、旋轉、翻轉及裁切。
 5. 一般儲存、分享、刪除與外部 `EDIT` Intent。
 6. 淺色及深色模式。
+7. 照片瀏覽控制列與系統列顯示／隱藏。
+8. 大型圖庫分頁載入、日期排序與刪除後照片位置。
 
 ## GitHub Pre-release
 
@@ -72,6 +74,18 @@ v1.0.0-prerelease
 
 ```powershell
 gh release create v1.0.0-prerelease app/build/outputs/apk/prerelease/app-prerelease.apk --prerelease --title "1.0.0-prerelease" --notes "Pre-release 版本"
+```
+
+建立前建議先產生最新 APK：
+
+```powershell
+.\gradlew.bat clean testDebugUnitTest lintDebug lintPrerelease assemblePrerelease
+```
+
+Release 附件：
+
+```text
+app/build/outputs/apk/prerelease/app-prerelease.apk
 ```
 
 ## 正式發行前必要調整

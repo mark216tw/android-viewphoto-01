@@ -4,10 +4,13 @@ import android.content.ContentResolver
 import android.content.ContentUris
 import android.content.ContentValues
 import android.content.Context
+import android.database.ContentObserver
+import android.database.sqlite.SQLiteException
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Build
+import android.os.Bundle
 import android.os.Environment
 import android.provider.MediaStore
 import android.provider.OpenableColumns
@@ -16,15 +19,28 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
 
+data class PhotoPage(
+    val photos: List<Photo>,
+    val hasMore: Boolean,
+)
+
+internal fun effectiveDateMillis(dateTakenMillis: Long, dateAddedSeconds: Long): Long =
+    dateTakenMillis.takeIf { it > 0 } ?: dateAddedSeconds * 1_000
+
+internal fun comparePhotoOrder(firstDate: Long, firstId: Long, secondDate: Long, secondId: Long): Int =
+    if (firstDate != secondDate) secondDate.compareTo(firstDate) else secondId.compareTo(firstId)
+
 class PhotoRepository(private val context: Context) {
     private val resolver: ContentResolver = context.contentResolver
-
-    suspend fun loadPhotos(): List<Photo> = withContext(Dispatchers.IO) {
-        val collection = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+    private val photoCollection: Uri
+        get() = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL)
         } else {
             MediaStore.Images.Media.EXTERNAL_CONTENT_URI
         }
+
+    suspend fun loadPhotos(offset: Int, limit: Int): PhotoPage = withContext(Dispatchers.IO) {
+        val collection = photoCollection
         val projection = arrayOf(
             MediaStore.Images.Media._ID,
             MediaStore.Images.Media.DISPLAY_NAME,
@@ -33,49 +49,94 @@ class PhotoRepository(private val context: Context) {
             MediaStore.Images.Media.SIZE,
             MediaStore.Images.Media.DATE_TAKEN,
             MediaStore.Images.Media.DATE_ADDED,
+            MediaStore.Images.Media.BUCKET_ID,
             MediaStore.Images.Media.BUCKET_DISPLAY_NAME,
             MediaStore.Images.Media.MIME_TYPE,
         )
-
-        buildList {
-            resolver.query(
+        val photos = try {
+            val queryArgs = Bundle().apply {
+                putString(ContentResolver.QUERY_ARG_SQL_SORT_ORDER, PHOTO_SORT_ORDER)
+                putInt(ContentResolver.QUERY_ARG_LIMIT, limit + 1)
+                putInt(ContentResolver.QUERY_ARG_OFFSET, offset)
+            }
+            queryPhotos(
                 collection,
                 projection,
-                null,
-                null,
-                "${MediaStore.Images.Media.DATE_TAKEN} DESC, ${MediaStore.Images.Media.DATE_ADDED} DESC",
-            )?.use { cursor ->
-                val id = cursor.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
-                val name = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DISPLAY_NAME)
-                val width = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.WIDTH)
-                val height = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.HEIGHT)
-                val size = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.SIZE)
-                val taken = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DATE_TAKEN)
-                val added = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DATE_ADDED)
-                val bucket = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.BUCKET_DISPLAY_NAME)
-                val mime = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.MIME_TYPE)
-
-                while (cursor.moveToNext()) {
-                    add(
-                        Photo(
-                            id = cursor.getLong(id),
-                            uri = ContentUris.withAppendedId(collection, cursor.getLong(id)),
-                            name = cursor.getString(name) ?: "未命名圖片",
-                            width = cursor.getInt(width),
-                            height = cursor.getInt(height),
-                            size = cursor.getLong(size),
-                            dateTakenMillis = cursor.getLong(taken).takeIf { it > 0 }
-                                ?: cursor.getLong(added) * 1_000,
-                            bucketName = cursor.getString(bucket) ?: "其他",
-                            mimeType = cursor.getString(mime) ?: "image/jpeg",
-                        )
-                    )
-                }
+                queryArgs = queryArgs,
+                sortOrder = null,
+                maxRows = limit + 1,
+            )
+        } catch (error: RuntimeException) {
+            if (error !is IllegalArgumentException && error !is SQLiteException && error !is UnsupportedOperationException) {
+                throw error
             }
-        }.sortedWith(
-            compareByDescending<Photo> { it.dateTakenMillis }
-                .thenByDescending { it.id }
-        )
+            queryPhotos(
+                collection = collection,
+                projection = projection,
+                queryArgs = null,
+                sortOrder = MediaStore.Images.Media._ID + " DESC",
+                maxRows = null,
+            ).sortedWith { first, second ->
+                comparePhotoOrder(first.dateTakenMillis, first.id, second.dateTakenMillis, second.id)
+            }.drop(offset).take(limit + 1)
+        }
+        PhotoPage(photos = photos.take(limit), hasMore = photos.size > limit)
+    }
+
+    private fun queryPhotos(
+        collection: Uri,
+        projection: Array<String>,
+        queryArgs: Bundle?,
+        sortOrder: String?,
+        maxRows: Int?,
+    ): List<Photo> {
+        val cursor = if (queryArgs != null) {
+            resolver.query(collection, projection, queryArgs, null)
+        } else {
+            resolver.query(collection, projection, null, null, sortOrder)
+        } ?: error("無法查詢圖片")
+        val photos = mutableListOf<Photo>()
+        cursor.use {
+            val idIndex = cursor.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
+            val nameIndex = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DISPLAY_NAME)
+            val widthIndex = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.WIDTH)
+            val heightIndex = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.HEIGHT)
+            val sizeIndex = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.SIZE)
+            val takenIndex = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DATE_TAKEN)
+            val addedIndex = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DATE_ADDED)
+            val bucketIdIndex = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.BUCKET_ID)
+            val bucketIndex = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.BUCKET_DISPLAY_NAME)
+            val mimeIndex = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.MIME_TYPE)
+
+            while (cursor.moveToNext() && (maxRows == null || photos.size < maxRows)) {
+                val id = cursor.getLong(idIndex)
+                val bucketName = cursor.getString(bucketIndex)
+                photos += Photo(
+                    id = id,
+                    uri = ContentUris.withAppendedId(collection, id),
+                    name = cursor.getString(nameIndex) ?: "未命名圖片",
+                    width = cursor.getInt(widthIndex),
+                    height = cursor.getInt(heightIndex),
+                    size = cursor.getLong(sizeIndex),
+                    dateTakenMillis = effectiveDateMillis(
+                        cursor.getLong(takenIndex),
+                        cursor.getLong(addedIndex),
+                    ),
+                    bucketId = cursor.getString(bucketIdIndex) ?: bucketName ?: "other",
+                    bucketName = bucketName ?: "其他",
+                    mimeType = cursor.getString(mimeIndex) ?: "image/jpeg",
+                )
+            }
+        }
+        return photos
+    }
+
+    fun registerPhotoObserver(observer: ContentObserver) {
+        resolver.registerContentObserver(photoCollection, true, observer)
+    }
+
+    fun unregisterPhotoObserver(observer: ContentObserver) {
+        resolver.unregisterContentObserver(observer)
     }
 
     suspend fun loadExternalPhoto(uri: Uri): Photo = withContext(Dispatchers.IO) {
@@ -107,6 +168,7 @@ class PhotoRepository(private val context: Context) {
             height = bounds.outHeight.coerceAtLeast(0),
             size = size,
             dateTakenMillis = System.currentTimeMillis(),
+            bucketId = "external",
             bucketName = "外部圖片",
             mimeType = resolver.getType(uri) ?: "image/*",
         )
@@ -114,9 +176,11 @@ class PhotoRepository(private val context: Context) {
 
     suspend fun saveBitmap(bitmap: Bitmap): Uri = withContext(Dispatchers.IO) {
         val timestamp = System.currentTimeMillis()
+        val output = bitmap.outputSpec()
+        val displayName = "mini_$timestamp.${output.extension}"
         val values = ContentValues().apply {
-            put(MediaStore.Images.Media.DISPLAY_NAME, "mini_$timestamp.jpg")
-            put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+            put(MediaStore.Images.Media.DISPLAY_NAME, displayName)
+            put(MediaStore.Images.Media.MIME_TYPE, output.mimeType)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/MiniPhotoViewer")
                 put(MediaStore.Images.Media.IS_PENDING, 1)
@@ -125,7 +189,7 @@ class PhotoRepository(private val context: Context) {
                     Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES),
                     "MiniPhotoViewer",
                 ).apply { mkdirs() }
-                put(MediaStore.Images.Media.DATA, java.io.File(directory, "mini_$timestamp.jpg").absolutePath)
+                put(MediaStore.Images.Media.DATA, java.io.File(directory, displayName).absolutePath)
             }
         }
         val collection = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -136,7 +200,7 @@ class PhotoRepository(private val context: Context) {
         val uri = resolver.insert(collection, values) ?: error("無法建立圖片檔案")
         try {
             resolver.openOutputStream(uri)?.use { stream ->
-                check(bitmap.compress(Bitmap.CompressFormat.JPEG, 95, stream))
+                check(bitmap.compress(output.format, output.quality, stream))
             } ?: error("無法開啟輸出檔案")
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 resolver.update(uri, ContentValues().apply {
@@ -155,14 +219,31 @@ class PhotoRepository(private val context: Context) {
         val expiration = System.currentTimeMillis() - SHARE_CACHE_MAX_AGE_MILLIS
         directory.listFiles()?.filter { it.isFile && it.lastModified() < expiration }?.forEach(File::delete)
 
-        val file = File(directory, "mini_share_${System.currentTimeMillis()}.jpg")
+        val output = bitmap.outputSpec()
+        val file = File(directory, "mini_share_${System.currentTimeMillis()}.${output.extension}")
         file.outputStream().use { stream ->
-            check(bitmap.compress(Bitmap.CompressFormat.JPEG, 95, stream))
+            check(bitmap.compress(output.format, output.quality, stream))
         }
         FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
     }
 
     private companion object {
+        const val PHOTO_SORT_ORDER = "CASE WHEN ${MediaStore.Images.Media.DATE_TAKEN} IS NOT NULL " +
+            "AND ${MediaStore.Images.Media.DATE_TAKEN} > 0 THEN ${MediaStore.Images.Media.DATE_TAKEN} " +
+            "ELSE ${MediaStore.Images.Media.DATE_ADDED} * 1000 END DESC, ${MediaStore.Images.Media._ID} DESC"
         const val SHARE_CACHE_MAX_AGE_MILLIS = 24 * 60 * 60 * 1_000L
     }
+}
+
+private data class BitmapOutput(
+    val extension: String,
+    val mimeType: String,
+    val format: Bitmap.CompressFormat,
+    val quality: Int,
+)
+
+private fun Bitmap.outputSpec(): BitmapOutput = if (hasAlpha()) {
+    BitmapOutput("png", "image/png", Bitmap.CompressFormat.PNG, 100)
+} else {
+    BitmapOutput("jpg", "image/jpeg", Bitmap.CompressFormat.JPEG, 95)
 }

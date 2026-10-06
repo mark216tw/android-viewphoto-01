@@ -10,6 +10,7 @@ data class Photo(
     val height: Int,
     val size: Long,
     val dateTakenMillis: Long,
+    val bucketId: String,
     val bucketName: String,
     val mimeType: String,
 )

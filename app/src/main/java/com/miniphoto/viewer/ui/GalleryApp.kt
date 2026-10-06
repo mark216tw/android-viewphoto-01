@@ -23,6 +23,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.GridItemSpan
+import androidx.compose.foundation.lazy.grid.LazyGridState
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.grid.rememberLazyGridState
@@ -66,6 +67,7 @@ import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -82,13 +84,14 @@ import java.text.DateFormat
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import kotlinx.coroutines.flow.distinctUntilChanged
 
 private sealed interface Screen {
     data object Gallery : Screen
     data object Settings : Screen
     data class Viewer(
         val initialPhotoId: Long,
-        val bucketName: String?,
+        val bucketId: String?,
         val viewport: PhotoViewport = PhotoViewport(),
     ) : Screen
     data class ExternalViewer(
@@ -98,7 +101,7 @@ private sealed interface Screen {
     data class Editor(
         val photo: Photo,
         val viewport: PhotoViewport,
-        val bucketName: String?,
+        val bucketId: String?,
         val returnToExternal: Boolean = false,
         val directExternalEdit: Boolean = false,
     ) : Screen
@@ -106,12 +109,45 @@ private sealed interface Screen {
 
 private enum class GallerySection { PHOTOS, FOLDERS }
 
+private data class ViewerPosition(
+    val photoId: Long,
+    val viewport: PhotoViewport,
+)
+
+internal data class PendingPhotoDeletion(
+    val deletedPhotoId: Long,
+    val nextPhotoId: Long?,
+    val previousPhotoId: Long?,
+    val previousIndex: Int,
+)
+
+internal fun resolveViewerIndex(
+    photoIds: List<Long>,
+    preferredPhotoId: Long,
+    initialPhotoId: Long,
+    pendingDeletion: PendingPhotoDeletion?,
+): Int {
+    photoIds.indexOf(preferredPhotoId).takeIf { it >= 0 }?.let { return it }
+    if (pendingDeletion?.deletedPhotoId == preferredPhotoId) {
+        pendingDeletion.nextPhotoId?.let { id ->
+            photoIds.indexOf(id).takeIf { it >= 0 }?.let { return it }
+        }
+        pendingDeletion.previousPhotoId?.let { id ->
+            photoIds.indexOf(id).takeIf { it >= 0 }?.let { return it }
+        }
+        if (photoIds.isNotEmpty()) return pendingDeletion.previousIndex.coerceIn(photoIds.indices)
+    }
+    photoIds.indexOf(initialPhotoId).takeIf { it >= 0 }?.let { return it }
+    return 0
+}
+
 @Composable
 fun GalleryApp(
     state: GalleryUiState,
     hasPermission: Boolean,
     requestPermission: () -> Unit,
     refresh: () -> Unit,
+    loadMore: () -> Unit,
     share: (Uri) -> Unit,
     delete: (Uri) -> Unit,
     externalPhotoRequest: ExternalPhotoRequest?,
@@ -119,11 +155,24 @@ fun GalleryApp(
     displayMode: DisplayMode,
     setDisplayMode: (DisplayMode) -> Unit,
     setPhotoViewerVisible: (Boolean) -> Unit,
+    setPhotoViewerControlsVisible: (Boolean) -> Unit,
+    finishExternal: () -> Unit,
+    externalEditSaved: (Uri) -> Unit,
+    writePermissionGranted: Boolean,
+    requestWritePermission: () -> Unit,
 ) {
     var screen: Screen by remember { mutableStateOf(Screen.Gallery) }
+    var gallerySection by remember { mutableStateOf(GallerySection.PHOTOS) }
+    var selectedBucketId by remember { mutableStateOf<String?>(null) }
+    val photoGridState = rememberLazyGridState()
+    val folderGridState = rememberLazyGridState()
+    var viewerPosition by remember { mutableStateOf<ViewerPosition?>(null) }
+    var pendingDeletion by remember { mutableStateOf<PendingPhotoDeletion?>(null) }
 
     LaunchedEffect(screen) {
-        setPhotoViewerVisible(screen is Screen.Viewer || screen is Screen.ExternalViewer)
+        val viewer = screen is Screen.Viewer || screen is Screen.ExternalViewer
+        setPhotoViewerVisible(viewer)
+        if (!viewer) setPhotoViewerControlsVisible(true)
     }
 
     LaunchedEffect(externalPhotoRequest) {
@@ -133,7 +182,7 @@ fun GalleryApp(
                 ExternalOpenMode.EDIT -> Screen.Editor(
                     photo = request.photo,
                     viewport = PhotoViewport(),
-                    bucketName = null,
+                    bucketId = null,
                     directExternalEdit = true,
                 )
             }
@@ -145,13 +194,15 @@ fun GalleryApp(
             is Screen.Editor -> when {
                 current.directExternalEdit -> {
                     clearExternalPhoto()
+                    finishExternal()
                     Screen.Gallery
                 }
                 current.returnToExternal -> Screen.ExternalViewer(current.photo, current.viewport)
-                else -> Screen.Viewer(current.photo.id, current.bucketName, current.viewport)
+                else -> Screen.Viewer(current.photo.id, current.bucketId, current.viewport)
             }
             is Screen.ExternalViewer -> {
                 clearExternalPhoto()
+                finishExternal()
                 Screen.Gallery
             }
             else -> Screen.Gallery
@@ -168,8 +219,26 @@ fun GalleryApp(
                 hasPermission = hasPermission,
                 requestPermission = requestPermission,
                 refresh = refresh,
-                openPhoto = { photo, bucketName ->
-                    screen = Screen.Viewer(photo.id, bucketName)
+                loadMore = loadMore,
+                section = gallerySection,
+                selectedBucketId = selectedBucketId,
+                photoGridState = photoGridState,
+                folderGridState = folderGridState,
+                onSectionSelected = { section ->
+                    gallerySection = section
+                    if (section == GallerySection.PHOTOS) selectedBucketId = null
+                },
+                onFolderSelected = { bucketId ->
+                    gallerySection = GallerySection.FOLDERS
+                    selectedBucketId = bucketId
+                },
+                onFolderBack = {
+                    gallerySection = GallerySection.FOLDERS
+                    selectedBucketId = null
+                },
+                openPhoto = { photo, bucketId ->
+                    viewerPosition = ViewerPosition(photo.id, PhotoViewport())
+                    screen = Screen.Viewer(photo.id, bucketId)
                 },
                 openSettings = { screen = Screen.Settings },
             )
@@ -179,20 +248,52 @@ fun GalleryApp(
                 close = { screen = Screen.Gallery },
             )
             is Screen.Viewer -> {
-                val viewerPhotos = remember(state.photos, target.bucketName) {
-                    state.photos.filter { target.bucketName == null || it.bucketName == target.bucketName }
+                val viewerPhotos = remember(state.photos, target.bucketId) {
+                    state.photos.filter { target.bucketId == null || it.bucketId == target.bucketId }
                 }
-                val initialIndex = viewerPhotos.indexOfFirst { it.id == target.initialPhotoId }
-                    .coerceAtLeast(0)
+                val preferredPhotoId = viewerPosition?.photoId ?: target.initialPhotoId
+                val initialIndex = resolveViewerIndex(
+                    photoIds = viewerPhotos.map { it.id },
+                    preferredPhotoId = preferredPhotoId,
+                    initialPhotoId = target.initialPhotoId,
+                    pendingDeletion = pendingDeletion,
+                )
+                val resolvedPhotoId = viewerPhotos.getOrNull(initialIndex)?.id
+                val resolvedViewport = if (resolvedPhotoId == preferredPhotoId) {
+                    viewerPosition?.viewport ?: target.viewport
+                } else {
+                    PhotoViewport()
+                }
                 PhotoViewer(
                     photos = viewerPhotos,
                     initialIndex = initialIndex,
                     close = { screen = Screen.Gallery },
+                    onPageChanged = { photo, viewport ->
+                        viewerPosition = ViewerPosition(photo.id, viewport)
+                        if (photo.id != pendingDeletion?.deletedPhotoId) pendingDeletion = null
+                    },
+                    setControlsVisible = setPhotoViewerControlsVisible,
                     share = share,
-                    delete = { photo -> delete(photo.uri) },
-                    initialViewport = target.viewport,
+                    delete = { photo ->
+                        val index = viewerPhotos.indexOfFirst { it.id == photo.id }
+                        if (index >= 0) {
+                            pendingDeletion = PendingPhotoDeletion(
+                                deletedPhotoId = photo.id,
+                                nextPhotoId = viewerPhotos.getOrNull(index + 1)?.id,
+                                previousPhotoId = viewerPhotos.getOrNull(index - 1)?.id,
+                                previousIndex = index,
+                            )
+                        }
+                        delete(photo.uri)
+                    },
+                    initialViewport = resolvedViewport,
+                    hasMore = state.hasMore,
+                    loadingMore = state.loadingMore,
+                    loadError = state.error,
+                    loadMore = loadMore,
                     edit = { photo, viewport ->
-                        screen = Screen.Editor(photo, viewport, target.bucketName)
+                        viewerPosition = ViewerPosition(photo.id, viewport)
+                        screen = Screen.Editor(photo, viewport, target.bucketId)
                     },
                 )
             }
@@ -201,16 +302,23 @@ fun GalleryApp(
                 initialIndex = 0,
                 close = {
                     clearExternalPhoto()
+                    finishExternal()
                     screen = Screen.Gallery
                 },
+                onPageChanged = { _, _ -> },
+                setControlsVisible = setPhotoViewerControlsVisible,
                 share = share,
                 delete = null,
                 initialViewport = target.viewport,
+                hasMore = false,
+                loadingMore = false,
+                loadError = null,
+                loadMore = {},
                 edit = { photo, viewport ->
                     screen = Screen.Editor(
                         photo = photo,
                         viewport = viewport,
-                        bucketName = null,
+                        bucketId = null,
                         returnToExternal = true,
                     )
                 },
@@ -222,18 +330,26 @@ fun GalleryApp(
                     screen = when {
                         target.directExternalEdit -> {
                             clearExternalPhoto()
+                            finishExternal()
                             Screen.Gallery
                         }
                         target.returnToExternal -> Screen.ExternalViewer(target.photo, target.viewport)
-                        else -> Screen.Viewer(target.photo.id, target.bucketName, target.viewport)
+                        else -> Screen.Viewer(target.photo.id, target.bucketId, target.viewport)
                     }
                 },
-                saved = {
-                    refresh()
-                    if (target.returnToExternal || target.directExternalEdit) clearExternalPhoto()
-                    screen = Screen.Gallery
+                saved = { outputUri ->
+                    if (target.directExternalEdit) {
+                        clearExternalPhoto()
+                        externalEditSaved(outputUri)
+                    } else {
+                        refresh()
+                        if (target.returnToExternal) clearExternalPhoto()
+                        screen = Screen.Gallery
+                    }
                 },
                 share = share,
+                writePermissionGranted = writePermissionGranted,
+                requestWritePermission = requestWritePermission,
             )
         }
     }
@@ -246,13 +362,22 @@ private fun GalleryScreen(
     hasPermission: Boolean,
     requestPermission: () -> Unit,
     refresh: () -> Unit,
+    loadMore: () -> Unit,
+    section: GallerySection,
+    selectedBucketId: String?,
+    photoGridState: LazyGridState,
+    folderGridState: LazyGridState,
+    onSectionSelected: (GallerySection) -> Unit,
+    onFolderSelected: (String) -> Unit,
+    onFolderBack: () -> Unit,
     openPhoto: (Photo, String?) -> Unit,
     openSettings: () -> Unit,
 ) {
-    var section by remember { mutableStateOf(GallerySection.PHOTOS) }
-    var selectedBucket by remember { mutableStateOf<String?>(null) }
-    val visiblePhotos = remember(state.photos, selectedBucket) {
-        state.photos.filter { selectedBucket == null || it.bucketName == selectedBucket }
+    val selectedBucketName = remember(state.photos, selectedBucketId) {
+        state.photos.firstOrNull { it.bucketId == selectedBucketId }?.bucketName
+    }
+    val visiblePhotos = remember(state.photos, selectedBucketId) {
+        state.photos.filter { selectedBucketId == null || it.bucketId == selectedBucketId }
     }
     Scaffold(
         topBar = {
@@ -260,15 +385,15 @@ private fun GalleryScreen(
                 title = {
                     Column {
                         Text(
-                            selectedBucket ?: if (section == GallerySection.FOLDERS) "資料夾" else "mini相片瀏覽器",
+                            selectedBucketName ?: if (section == GallerySection.FOLDERS) "資料夾" else "mini相片瀏覽器",
                             style = MaterialTheme.typography.titleLarge,
                         )
                         if (state.photos.isNotEmpty()) {
                             Text(
-                                if (section == GallerySection.FOLDERS && selectedBucket == null) {
-                                    "${state.photos.map { it.bucketName }.distinct().size} 個資料夾"
+                                if (section == GallerySection.FOLDERS && selectedBucketId == null) {
+                                    "${state.photos.map { it.bucketId }.distinct().size}${if (state.hasMore) "+" else ""} 個資料夾"
                                 } else {
-                                    "${visiblePhotos.size} 張圖片"
+                                    "${visiblePhotos.size}${if (state.hasMore) "+" else ""} 張圖片"
                                 },
                                 style = MaterialTheme.typography.labelMedium,
                             )
@@ -276,11 +401,8 @@ private fun GalleryScreen(
                     }
                 },
                 navigationIcon = {
-                    if (selectedBucket != null) {
-                        IconButton(onClick = {
-                            selectedBucket = null
-                            section = GallerySection.FOLDERS
-                        }) {
+                    if (selectedBucketId != null) {
+                        IconButton(onClick = onFolderBack) {
                             Icon(Icons.AutoMirrored.Rounded.ArrowBack, contentDescription = "返回資料夾")
                         }
                     }
@@ -299,19 +421,13 @@ private fun GalleryScreen(
             NavigationBar {
                 NavigationBarItem(
                     selected = section == GallerySection.PHOTOS,
-                    onClick = {
-                        section = GallerySection.PHOTOS
-                        selectedBucket = null
-                    },
+                    onClick = { onSectionSelected(GallerySection.PHOTOS) },
                     icon = { Icon(Icons.Rounded.Image, contentDescription = null) },
                     label = { Text("相片") },
                 )
                 NavigationBarItem(
                     selected = section == GallerySection.FOLDERS,
-                    onClick = {
-                        section = GallerySection.FOLDERS
-                        selectedBucket = null
-                    },
+                    onClick = { onSectionSelected(GallerySection.FOLDERS) },
                     icon = { Icon(Icons.Rounded.Folder, contentDescription = null) },
                     label = { Text("資料夾") },
                 )
@@ -324,7 +440,7 @@ private fun GalleryScreen(
                 modifier = Modifier.fillMaxSize().padding(padding),
                 contentAlignment = Alignment.Center,
             ) { CircularProgressIndicator() }
-            state.error != null -> MessageState(
+            state.error != null && state.photos.isEmpty() -> MessageState(
                 title = "無法讀取圖片",
                 message = state.error,
                 action = "再試一次",
@@ -339,19 +455,27 @@ private fun GalleryScreen(
                 modifier = Modifier.padding(padding),
             )
             else -> {
-                if (section == GallerySection.FOLDERS && selectedBucket == null) {
+                if (section == GallerySection.FOLDERS && selectedBucketId == null) {
                     FolderGrid(
                         photos = state.photos,
+                        state = folderGridState,
+                        hasMore = state.hasMore,
+                        loadingMore = state.loadingMore,
+                        loadError = state.error,
+                        loadMore = loadMore,
                         modifier = Modifier.padding(padding),
-                        openFolder = {
-                            selectedBucket = it
-                        },
+                        openFolder = onFolderSelected,
                     )
                 } else {
                     PhotoGrid(
                         photos = visiblePhotos,
+                        state = photoGridState,
+                        hasMore = state.hasMore,
+                        loadingMore = state.loadingMore,
+                        loadMore = loadMore,
+                        loadError = state.error,
                         modifier = Modifier.padding(padding),
-                        openPhoto = { photo -> openPhoto(photo, selectedBucket) },
+                        openPhoto = { photo -> openPhoto(photo, selectedBucketId) },
                     )
                 }
             }
@@ -433,13 +557,19 @@ private fun DisplayModeItem(
 @Composable
 private fun PhotoGrid(
     photos: List<Photo>,
+    state: LazyGridState,
+    hasMore: Boolean,
+    loadingMore: Boolean,
+    loadMore: () -> Unit,
+    loadError: String?,
     modifier: Modifier = Modifier,
     openPhoto: (Photo) -> Unit,
 ) {
     val grouped = remember(photos) { photos.groupBy { photoDateLabel(it.dateTakenMillis) } }
+    LoadMoreEffect(state, hasMore, loadingMore, loadError, photos.size, loadMore)
     LazyVerticalGrid(
         columns = GridCells.Adaptive(108.dp),
-        state = rememberLazyGridState(),
+        state = state,
         modifier = modifier.fillMaxSize(),
         contentPadding = PaddingValues(start = 6.dp, end = 6.dp, bottom = 24.dp),
         horizontalArrangement = Arrangement.spacedBy(3.dp),
@@ -467,25 +597,51 @@ private fun PhotoGrid(
                 )
             }
         }
+        if (loadingMore || loadError != null) {
+            item(span = { GridItemSpan(maxLineSpan) }, key = "load-more") {
+                Box(
+                    modifier = Modifier.fillMaxWidth().padding(20.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    if (loadingMore) {
+                        CircularProgressIndicator(Modifier.size(28.dp), strokeWidth = 2.dp)
+                    } else {
+                        Button(onClick = loadMore) { Text("載入更多") }
+                    }
+                }
+            }
+        }
     }
 }
 
 @Composable
 private fun FolderGrid(
     photos: List<Photo>,
+    state: LazyGridState,
+    hasMore: Boolean,
+    loadingMore: Boolean,
+    loadError: String?,
+    loadMore: () -> Unit,
     modifier: Modifier = Modifier,
     openFolder: (String) -> Unit,
 ) {
-    val folders = remember(photos) { photos.groupBy { it.bucketName }.toList().sortedBy { it.first } }
+    val folders = remember(photos) {
+        photos.groupBy { it.bucketId }
+            .toList()
+            .sortedBy { it.second.firstOrNull()?.bucketName.orEmpty() }
+    }
+    LoadMoreEffect(state, hasMore, loadingMore, loadError, folders.size, loadMore)
     LazyVerticalGrid(
         columns = GridCells.Adaptive(150.dp),
+        state = state,
         modifier = modifier.fillMaxSize(),
         contentPadding = PaddingValues(12.dp),
         horizontalArrangement = Arrangement.spacedBy(12.dp),
         verticalArrangement = Arrangement.spacedBy(18.dp),
     ) {
-        items(folders, key = { it.first }) { (name, folderPhotos) ->
-            Column(Modifier.clickable { openFolder(name) }) {
+        items(folders, key = { it.first }) { (id, folderPhotos) ->
+            val name = folderPhotos.firstOrNull()?.bucketName ?: "其他"
+            Column(Modifier.clickable { openFolder(id) }) {
                 AsyncImage(
                     model = folderPhotos.first().uri,
                     contentDescription = name,
@@ -500,6 +656,39 @@ private fun FolderGrid(
                 Text("${folderPhotos.size} 張", style = MaterialTheme.typography.bodySmall)
             }
         }
+        if (loadingMore || loadError != null) {
+            item(span = { GridItemSpan(maxLineSpan) }, key = "folder-load-more") {
+                Box(
+                    modifier = Modifier.fillMaxWidth().padding(20.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    if (loadingMore) {
+                        CircularProgressIndicator(Modifier.size(28.dp), strokeWidth = 2.dp)
+                    } else {
+                        Button(onClick = loadMore) { Text("載入更多") }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun LoadMoreEffect(
+    state: LazyGridState,
+    hasMore: Boolean,
+    loadingMore: Boolean,
+    loadError: String?,
+    itemCount: Int,
+    loadMore: () -> Unit,
+) {
+    LaunchedEffect(state, hasMore, loadingMore, loadError, itemCount) {
+        if (!hasMore || loadingMore || loadError != null) return@LaunchedEffect
+        snapshotFlow { state.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: -1 }
+            .distinctUntilChanged()
+            .collect { lastVisible ->
+                if (lastVisible >= state.layoutInfo.totalItemsCount - 12) loadMore()
+            }
     }
 }
 
@@ -548,28 +737,63 @@ private fun PhotoViewer(
     photos: List<Photo>,
     initialIndex: Int,
     close: () -> Unit,
+    onPageChanged: (Photo, PhotoViewport) -> Unit,
+    setControlsVisible: (Boolean) -> Unit,
     share: (Uri) -> Unit,
     delete: ((Photo) -> Unit)?,
     initialViewport: PhotoViewport,
+    hasMore: Boolean,
+    loadingMore: Boolean,
+    loadError: String?,
+    loadMore: () -> Unit,
     edit: (Photo, PhotoViewport) -> Unit,
 ) {
     if (photos.isEmpty()) {
-        LaunchedEffect(Unit) { close() }
+        LaunchedEffect(hasMore, loadingMore, loadError) {
+            when {
+                hasMore && !loadingMore && loadError == null -> loadMore()
+                !hasMore -> close()
+            }
+        }
+        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            if (loadError == null) CircularProgressIndicator() else Text("無法載入圖片")
+        }
         return
     }
     val pagerState = rememberPagerState(initialPage = initialIndex) { photos.size }
     var showInfo by remember { mutableStateOf(false) }
     var controlsVisible by remember { mutableStateOf(true) }
     val viewports = remember { mutableStateMapOf<Long, PhotoViewport>() }
-    LaunchedEffect(initialIndex, initialViewport) {
-        photos.getOrNull(initialIndex)?.let { viewports[it.id] = initialViewport }
+    LaunchedEffect(controlsVisible) {
+        setControlsVisible(controlsVisible)
     }
     val currentPage = pagerState.currentPage.coerceIn(0, photos.lastIndex)
     val currentPhoto = photos[currentPage]
 
-    LaunchedEffect(photos.size) {
-        val validPage = pagerState.currentPage.coerceIn(0, photos.lastIndex)
+    LaunchedEffect(pagerState, photos, initialIndex) {
+        val validPage = initialIndex.coerceIn(0, photos.lastIndex)
+        photos.getOrNull(validPage)?.let { photo ->
+            if (!viewports.containsKey(photo.id)) viewports[photo.id] = initialViewport
+        }
         if (validPage != pagerState.currentPage) pagerState.scrollToPage(validPage)
+        snapshotFlow {
+            val page = pagerState.settledPage.coerceIn(0, photos.lastIndex)
+            val photo = photos[page]
+            photo.id to (viewports[photo.id] ?: PhotoViewport())
+        }.distinctUntilChanged().collect { (photoId, viewport) ->
+            photos.firstOrNull { it.id == photoId }?.let { photo ->
+                onPageChanged(photo, viewport)
+            }
+        }
+    }
+
+    LaunchedEffect(pagerState, photos.size, hasMore, loadingMore, loadError) {
+        if (!hasMore || loadingMore || loadError != null) return@LaunchedEffect
+        snapshotFlow { pagerState.currentPage }
+            .distinctUntilChanged()
+            .collect { page ->
+                if (page >= photos.lastIndex - 3) loadMore()
+            }
     }
 
     Scaffold(

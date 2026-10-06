@@ -12,6 +12,9 @@ import android.graphics.PorterDuffXfermode
 import android.graphics.Shader
 import android.os.Build
 import androidx.compose.foundation.Canvas
+import androidx.activity.compose.BackHandler
+import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.exifinterface.media.ExifInterface
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -49,6 +52,7 @@ import androidx.compose.material.icons.rounded.Flip
 import androidx.compose.material.icons.rounded.Save
 import androidx.compose.material.icons.rounded.Share
 import androidx.compose.material3.Button
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -65,7 +69,6 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
-import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -97,11 +100,10 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlin.math.abs
+import kotlin.math.ceil
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
-
-private enum class EditTool { PEN, MARKER, ERASER, BLUR }
 
 private enum class ExportAction { SAVE, SHARE }
 
@@ -114,14 +116,20 @@ private const val PEN_COLOR_KEY = "pen_color"
 private const val MARKER_COLOR_KEY = "marker_color"
 private const val DEFAULT_EDIT_COLOR = -2_536_907
 
-private data class EditStroke(
-    val points: List<Offset>,
-    val color: Color,
-    val width: Float,
-    val tool: EditTool,
-)
-
 private enum class CropDrag { TOP_LEFT, TOP_RIGHT, BOTTOM_LEFT, BOTTOM_RIGHT, MOVE }
+
+private class StrokePathCache {
+    private var bounds = Rect.Zero
+    private val paths = java.util.IdentityHashMap<EditStroke, Path>()
+
+    fun path(stroke: EditStroke, currentBounds: Rect): Path {
+        if (bounds != currentBounds) {
+            bounds = currentBounds
+            paths.clear()
+        }
+        return paths.getOrPut(stroke) { stroke.toPath(currentBounds) }
+    }
+}
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -129,11 +137,15 @@ fun PhotoEditorScreen(
     photo: Photo,
     initialViewport: PhotoViewport = PhotoViewport(),
     close: () -> Unit,
-    saved: () -> Unit,
+    saved: (android.net.Uri) -> Unit,
     share: (android.net.Uri) -> Unit,
+    writePermissionGranted: Boolean = true,
+    requestWritePermission: () -> Unit = {},
 ) {
     val context = LocalContext.current
     val density = LocalDensity.current
+    val editorViewModel: PhotoEditorViewModel = viewModel(key = "photo-editor-${photo.id}")
+    editorViewModel.bind(photo.id, initialViewport)
     val scope = rememberCoroutineScope()
     val snackbar = remember { SnackbarHostState() }
     val editorPreferences = remember(context) {
@@ -142,10 +154,9 @@ fun PhotoEditorScreen(
     var bitmap by remember(photo.id) { mutableStateOf<Bitmap?>(null) }
     var blurSource by remember(photo.id) { mutableStateOf<Bitmap?>(null) }
     var loadError by remember { mutableStateOf<String?>(null) }
-    val strokes = remember(photo.id) { mutableStateListOf<EditStroke>() }
-    val redoStrokes = remember(photo.id) { mutableStateListOf<EditStroke>() }
-    var currentStroke by remember { mutableStateOf<EditStroke?>(null) }
-    var tool by remember { mutableStateOf(EditTool.PEN) }
+    val strokes = editorViewModel.strokes
+    val redoStrokes = editorViewModel.redoStrokes
+    val tool = editorViewModel.tool
     var penSize by remember {
         mutableFloatStateOf(editorPreferences.getFloat(PEN_SIZE_KEY, .5f).coerceIn(0f, 1f))
     }
@@ -165,10 +176,15 @@ fun PhotoEditorScreen(
         mutableStateOf(Color(editorPreferences.getInt(MARKER_COLOR_KEY, DEFAULT_EDIT_COLOR)))
     }
     val selectedColor = if (tool == EditTool.MARKER) markerColor else penColor
-    var cropMode by remember { mutableStateOf(false) }
-    var cropRect by remember { mutableStateOf(Rect(.08f, .08f, .92f, .92f)) }
     var exportAction by remember { mutableStateOf<ExportAction?>(null) }
-    var editorInitialViewport by remember(photo.id) { mutableStateOf(initialViewport) }
+    var isTransforming by remember(photo.id) { mutableStateOf(false) }
+    var showDiscardDialog by remember { mutableStateOf(false) }
+    var pendingSaveAfterPermission by remember { mutableStateOf(false) }
+    val cropMode = editorViewModel.cropMode
+    val cropRect = editorViewModel.cropRect
+    val currentStroke = editorViewModel.currentStroke
+    val editorInitialViewport = editorViewModel.editorInitialViewport
+    val isDirty = editorViewModel.isDirty
 
     LaunchedEffect(photo.uri) {
         runCatching { withContext(Dispatchers.IO) { loadBitmap(context, photo) } }
@@ -185,12 +201,35 @@ fun PhotoEditorScreen(
 
     fun flattenAndTransform(transform: (Bitmap) -> Bitmap) {
         val source = bitmap ?: return
-        val flattened = renderBitmap(source, strokes, blurSource)
-        bitmap = transform(flattened)
-        blurSource = null
-        editorInitialViewport = PhotoViewport()
-        strokes.clear()
-        redoStrokes.clear()
+        if (isTransforming) return
+        val sourceStrokes = strokes.toList()
+        val sourceBlur = blurSource
+        isTransforming = true
+        scope.launch {
+            try {
+                val transformed = withContext(Dispatchers.Default) {
+                    val flattened = renderBitmap(source, sourceStrokes, sourceBlur)
+                    try {
+                        val result = transform(flattened)
+                        if (result !== flattened) flattened.recycle()
+                        result
+                    } catch (error: Throwable) {
+                        flattened.recycle()
+                        throw error
+                    }
+                }
+                bitmap = transformed
+                blurSource = null
+                editorViewModel.resetAfterTransform()
+                strokes.clear()
+                redoStrokes.clear()
+                editorViewModel.markDirty()
+            } catch (error: Exception) {
+                snackbar.showSnackbar(error.message ?: "無法處理圖片")
+            } finally {
+                isTransforming = false
+            }
+        }
     }
 
     fun transformBitmapAndStrokes(
@@ -198,33 +237,57 @@ fun PhotoEditorScreen(
         transformPoint: (Offset) -> Offset,
     ) {
         val source = bitmap ?: return
-        val transformedStrokes = strokes.map { stroke ->
-            stroke.copy(points = stroke.points.map(transformPoint))
+        if (isTransforming) return
+        val sourceStrokes = strokes.toList()
+        val sourceRedoStrokes = redoStrokes.toList()
+        isTransforming = true
+        scope.launch {
+            try {
+                val (transformedBitmap, transformedStrokes, transformedRedoStrokes) = withContext(Dispatchers.Default) {
+                    Triple(
+                        transformBitmap(source),
+                        sourceStrokes.map { stroke -> stroke.copy(points = stroke.points.map(transformPoint)) },
+                        sourceRedoStrokes.map { stroke -> stroke.copy(points = stroke.points.map(transformPoint)) },
+                    )
+                }
+                bitmap = transformedBitmap
+                blurSource = null
+                editorViewModel.currentStroke = null
+                editorViewModel.resetAfterTransform()
+                strokes.clear()
+                strokes.addAll(transformedStrokes)
+                redoStrokes.clear()
+                redoStrokes.addAll(transformedRedoStrokes)
+                editorViewModel.markDirty()
+            } catch (error: Exception) {
+                snackbar.showSnackbar(error.message ?: "無法處理圖片")
+            } finally {
+                isTransforming = false
+            }
         }
-        val transformedRedoStrokes = redoStrokes.map { stroke ->
-            stroke.copy(points = stroke.points.map(transformPoint))
-        }
-        bitmap = transformBitmap(source)
-        blurSource = null
-        currentStroke = null
-        editorInitialViewport = PhotoViewport()
-        strokes.clear()
-        strokes.addAll(transformedStrokes)
-        redoStrokes.clear()
-        redoStrokes.addAll(transformedRedoStrokes)
     }
 
     fun export(action: ExportAction) {
         val source = bitmap ?: return
+        if (action == ExportAction.SAVE && !writePermissionGranted) {
+            pendingSaveAfterPermission = true
+            requestWritePermission()
+            return
+        }
         exportAction = action
         scope.launch {
             runCatching {
-                val output = withContext(Dispatchers.Default) { renderBitmap(source, strokes, blurSource) }
-                val repository = PhotoRepository(context)
-                if (action == ExportAction.SHARE) repository.saveShareBitmap(output) else repository.saveBitmap(output)
+                val output = withContext(Dispatchers.Default) { renderBitmap(source, strokes.toList(), blurSource) }
+                try {
+                    val repository = PhotoRepository(context)
+                    if (action == ExportAction.SHARE) repository.saveShareBitmap(output) else repository.saveBitmap(output)
+                } finally {
+                    output.recycle()
+                }
             }.onSuccess { outputUri ->
                 exportAction = null
-                if (action == ExportAction.SHARE) share(outputUri) else saved()
+                if (action == ExportAction.SAVE) editorViewModel.markSaved()
+                if (action == ExportAction.SHARE) share(outputUri) else saved(outputUri)
             }.onFailure {
                 exportAction = null
                 snackbar.showSnackbar(it.message ?: "儲存失敗")
@@ -232,13 +295,31 @@ fun PhotoEditorScreen(
         }
     }
 
+    LaunchedEffect(writePermissionGranted) {
+        if (writePermissionGranted && pendingSaveAfterPermission) {
+            pendingSaveAfterPermission = false
+            export(ExportAction.SAVE)
+        }
+    }
+
+    fun requestClose() {
+        if (isTransforming || exportAction != null) return
+        if (isDirty) showDiscardDialog = true else close()
+    }
+
+    fun handleBack() {
+        if (cropMode) editorViewModel.cancelCrop() else requestClose()
+    }
+
+    BackHandler(onBack = ::handleBack)
+
     Scaffold(
         snackbarHost = { SnackbarHost(snackbar) },
         topBar = {
             TopAppBar(
                 title = { Text(if (cropMode) "裁切圖片" else "編輯圖片") },
                 navigationIcon = {
-                    IconButton(onClick = { if (cropMode) cropMode = false else close() }) {
+                    IconButton(onClick = ::handleBack) {
                         Icon(Icons.AutoMirrored.Rounded.ArrowBack, "返回")
                     }
                 },
@@ -246,8 +327,8 @@ fun PhotoEditorScreen(
                     if (cropMode) {
                         TextButton(onClick = {
                             flattenAndTransform { cropBitmap(it, cropRect) }
-                            cropRect = Rect(.08f, .08f, .92f, .92f)
-                            cropMode = false
+                            editorViewModel.cropRect = Rect(.08f, .08f, .92f, .92f)
+                            editorViewModel.cropMode = false
                         }) {
                             Icon(Icons.Rounded.Check, null)
                             Text("套用")
@@ -256,18 +337,20 @@ fun PhotoEditorScreen(
                         IconButton(
                             onClick = {
                                 if (strokes.isNotEmpty()) redoStrokes.add(strokes.removeAt(strokes.lastIndex))
+                                editorViewModel.markDirty()
                             },
-                            enabled = strokes.isNotEmpty(),
+                            enabled = strokes.isNotEmpty() && !isTransforming,
                         ) { Icon(Icons.AutoMirrored.Rounded.Undo, "復原") }
                         IconButton(
                             onClick = {
                                 if (redoStrokes.isNotEmpty()) strokes.add(redoStrokes.removeAt(redoStrokes.lastIndex))
+                                editorViewModel.markDirty()
                             },
-                            enabled = redoStrokes.isNotEmpty(),
+                            enabled = redoStrokes.isNotEmpty() && !isTransforming,
                         ) { Icon(Icons.AutoMirrored.Rounded.Redo, "重做") }
                         IconButton(
                             onClick = { export(ExportAction.SHARE) },
-                            enabled = exportAction == null && bitmap != null,
+                            enabled = exportAction == null && bitmap != null && !isTransforming,
                         ) {
                             if (exportAction == ExportAction.SHARE) {
                                 CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp)
@@ -277,7 +360,7 @@ fun PhotoEditorScreen(
                         }
                         IconButton(
                             onClick = { export(ExportAction.SAVE) },
-                            enabled = exportAction == null && bitmap != null,
+                            enabled = exportAction == null && bitmap != null && !isTransforming,
                         ) {
                             if (exportAction == ExportAction.SAVE) CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp)
                             else Icon(Icons.Rounded.Save, "另存新檔")
@@ -297,7 +380,7 @@ fun PhotoEditorScreen(
                         EditTool.ERASER -> eraserSize
                         EditTool.BLUR -> blurSize
                     },
-                    selectTool = { tool = it },
+                    selectTool = { editorViewModel.tool = it },
                     selectColor = { color ->
                         when (tool) {
                             EditTool.PEN -> {
@@ -328,7 +411,7 @@ fun PhotoEditorScreen(
                         }
                         editorPreferences.edit().putFloat(key, value.coerceIn(0f, 1f)).apply()
                     },
-                    crop = { cropMode = true },
+                    crop = { editorViewModel.cropMode = true },
                     rotate = {
                         transformBitmapAndStrokes(
                             transformBitmap = ::rotateBitmap,
@@ -341,6 +424,7 @@ fun PhotoEditorScreen(
                             transformPoint = { point -> Offset(1f - point.x, point.y) },
                         )
                     },
+                    enabled = !isTransforming && exportAction == null,
                 )
             }
         },
@@ -358,6 +442,7 @@ fun PhotoEditorScreen(
                     blurSource = blurSource,
                     strokes = strokes,
                     currentStroke = currentStroke,
+                    interactionEnabled = !isTransforming && exportAction == null,
                     tool = tool,
                     color = selectedColor,
                     widthPxAt1x = with(density) {
@@ -370,17 +455,35 @@ fun PhotoEditorScreen(
                     },
                     cropMode = cropMode,
                     cropRect = cropRect,
-                    updateCrop = { cropRect = it },
-                    updateStroke = { currentStroke = it },
-                    cancelStroke = { currentStroke = null },
+                    updateCrop = { editorViewModel.cropRect = it },
+                    updateStroke = { editorViewModel.currentStroke = it },
+                    cancelStroke = { editorViewModel.currentStroke = null },
                     commitStroke = { stroke ->
                         strokes.add(stroke)
-                        currentStroke = null
+                        editorViewModel.currentStroke = null
                         redoStrokes.clear()
+                        editorViewModel.markDirty()
                     },
                 )
             }
         }
+    }
+
+    if (showDiscardDialog) {
+        AlertDialog(
+            onDismissRequest = { showDiscardDialog = false },
+            title = { Text("放棄未儲存的變更？") },
+            text = { Text("目前的編輯內容尚未儲存。離開後這些變更會遺失。") },
+            confirmButton = {
+                TextButton(onClick = {
+                    showDiscardDialog = false
+                    close()
+                }) { Text("放棄變更") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showDiscardDialog = false }) { Text("繼續編輯") }
+            },
+        )
     }
 }
 
@@ -396,6 +499,7 @@ private fun EditorControls(
     crop: () -> Unit,
     rotate: () -> Unit,
     flip: () -> Unit,
+    enabled: Boolean,
 ) {
     Column(
         modifier = Modifier
@@ -408,13 +512,13 @@ private fun EditorControls(
             modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp),
             horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            ToolButton("畫筆", Icons.Rounded.Brush, tool == EditTool.PEN) { selectTool(EditTool.PEN) }
-            ToolButton("螢光筆", Icons.Rounded.Edit, tool == EditTool.MARKER) { selectTool(EditTool.MARKER) }
-            ToolButton("橡皮擦", Icons.Rounded.DeleteSweep, tool == EditTool.ERASER) { selectTool(EditTool.ERASER) }
-            ToolButton("模糊", Icons.Rounded.BlurOn, tool == EditTool.BLUR) { selectTool(EditTool.BLUR) }
-            ToolButton("裁切", Icons.Rounded.ContentCut, false, crop)
-            ToolButton("旋轉", Icons.AutoMirrored.Rounded.RotateRight, false, rotate)
-            ToolButton("水平翻轉", Icons.Rounded.Flip, false, flip)
+            ToolButton("畫筆", Icons.Rounded.Brush, tool == EditTool.PEN, enabled) { selectTool(EditTool.PEN) }
+            ToolButton("螢光筆", Icons.Rounded.Edit, tool == EditTool.MARKER, enabled) { selectTool(EditTool.MARKER) }
+            ToolButton("橡皮擦", Icons.Rounded.DeleteSweep, tool == EditTool.ERASER, enabled) { selectTool(EditTool.ERASER) }
+            ToolButton("模糊", Icons.Rounded.BlurOn, tool == EditTool.BLUR, enabled) { selectTool(EditTool.BLUR) }
+            ToolButton("裁切", Icons.Rounded.ContentCut, false, enabled, crop)
+            ToolButton("旋轉", Icons.AutoMirrored.Rounded.RotateRight, false, enabled, rotate)
+            ToolButton("水平翻轉", Icons.Rounded.Flip, false, enabled, flip)
         }
         if (tool == EditTool.PEN || tool == EditTool.MARKER) {
             Row(
@@ -431,7 +535,7 @@ private fun EditorControls(
                             .size(if (item == color) 28.dp else 24.dp)
                             .background(item, CircleShape)
                             .then(if (item == color) Modifier.border(2.dp, MaterialTheme.colorScheme.onSurface, CircleShape) else Modifier)
-                            .clickable { selectColor(item) }
+                            .clickable(enabled = enabled) { selectColor(item) }
                     )
                 }
             }
@@ -443,8 +547,8 @@ private fun EditorControls(
             Text(if (tool == EditTool.BLUR) "範圍" else "粗細", style = MaterialTheme.typography.labelMedium)
             Slider(
                 value = size,
-                onValueChange = setSize,
-                onValueChangeFinished = saveSize,
+                onValueChange = { if (enabled) setSize(it) },
+                onValueChangeFinished = { if (enabled) saveSize() },
                 valueRange = 0f..1f,
                 modifier = Modifier.weight(1f).padding(start = 12.dp),
             )
@@ -482,6 +586,7 @@ private fun ToolButton(
     label: String,
     icon: androidx.compose.ui.graphics.vector.ImageVector,
     selected: Boolean,
+    enabled: Boolean,
     onClick: () -> Unit,
 ) {
     Column(
@@ -490,7 +595,7 @@ private fun ToolButton(
                 if (selected) MaterialTheme.colorScheme.secondaryContainer else Color.Transparent,
                 MaterialTheme.shapes.medium,
             )
-            .clickable(onClick = onClick)
+            .clickable(enabled = enabled, onClick = onClick)
             .padding(horizontal = 12.dp, vertical = 7.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
@@ -512,6 +617,7 @@ private fun EditorCanvas(
     initialViewport: PhotoViewport,
     strokes: List<EditStroke>,
     currentStroke: EditStroke?,
+    interactionEnabled: Boolean,
     tool: EditTool,
     color: Color,
     widthPxAt1x: Float,
@@ -529,10 +635,15 @@ private fun EditorCanvas(
     var panOffset by remember(bitmap) { mutableStateOf(Offset.Zero) }
     var viewportInitialized by remember(bitmap, initialViewport) { mutableStateOf(false) }
     val currentCropRect by rememberUpdatedState(cropRect)
+    val strokePathCache = remember(bitmap) { StrokePathCache() }
 
-    LaunchedEffect(viewportSize, fittedImageSize, initialViewport) {
-        if (!viewportInitialized && viewportSize != Size.Zero && fittedImageSize != Size.Zero) {
-            val scale = initialViewport.scale.coerceIn(1f, 10f)
+    LaunchedEffect(viewportSize, fittedImageSize, initialViewport, cropMode) {
+        if (cropMode) {
+            zoomScale = 1f
+            panOffset = Offset.Zero
+            viewportInitialized = true
+        } else if (!viewportInitialized && viewportSize != Size.Zero && fittedImageSize != Size.Zero) {
+            val scale = initialViewport.scale.coerceIn(1f, 20f)
             zoomScale = scale
             panOffset = initialViewport.toOffset(scale, fittedImageSize, viewportSize)
             viewportInitialized = true
@@ -542,7 +653,8 @@ private fun EditorCanvas(
     Canvas(
         modifier = Modifier
             .fillMaxSize()
-            .pointerInput(bitmap, cropMode, tool, color, widthPxAt1x) {
+            .pointerInput(bitmap, cropMode, tool, color, widthPxAt1x, interactionEnabled) {
+                if (!interactionEnabled) return@pointerInput
                 awaitEachGesture {
                     val down = awaitFirstDown(requireUnconsumed = false)
                     var activeStroke: EditStroke? = null
@@ -566,7 +678,7 @@ private fun EditorCanvas(
                             val fittedShortSide = min(fittedImageSize.width, fittedImageSize.height)
                             if (fittedShortSide <= 0f) return@awaitEachGesture
                             val normalizedWidth = widthPxAt1x / fittedShortSide
-                            EditStroke(listOf(point), color, normalizedWidth, tool).let {
+                            EditStroke(mutableListOf(point), color, normalizedWidth, tool).let {
                                 activeStroke = it
                                 updateStroke(it)
                             }
@@ -584,7 +696,7 @@ private fun EditorCanvas(
                                 cancelStroke()
                             }
                             val oldScale = zoomScale
-                            val nextScale = (oldScale * event.calculateZoom()).coerceIn(1f, 10f)
+                            val nextScale = (oldScale * event.calculateZoom()).coerceIn(1f, 20f)
                             if (nextScale == 1f) {
                                 panOffset = Offset.Zero
                             } else if (viewportSize != Size.Zero && fittedImageSize != Size.Zero) {
@@ -616,9 +728,16 @@ private fun EditorCanvas(
                                         updateCrop(updated)
                                     }
                                 } else {
-                                    activeStroke?.copy(points = activeStroke!!.points + point)?.let {
-                                        activeStroke = it
-                                        updateStroke(it)
+                                    activeStroke?.let { stroke ->
+                                        val points = stroke.points as MutableList<Offset>
+                                        val minimumDistance = max(.0008f, stroke.width * .04f)
+                                        if ((point - points.last()).getDistanceSquared() >= minimumDistance * minimumDistance) {
+                                            points.add(point)
+                                            stroke.copy(revision = stroke.revision + 1).let {
+                                                activeStroke = it
+                                                updateStroke(it)
+                                            }
+                                        }
                                     }
                                 }
                                 change.consume()
@@ -626,7 +745,9 @@ private fun EditorCanvas(
                         }
 
                         if (pressed.isEmpty()) {
-                            if (!transforming && !cropMode) activeStroke?.let(commitStroke)
+                            if (!transforming && !cropMode) {
+                                activeStroke?.let { commitStroke(it.copy(points = it.points.toList())) }
+                            }
                             break
                         }
                     }
@@ -651,11 +772,16 @@ private fun EditorCanvas(
             dstSize = IntSize(scaledWidth.roundToInt(), scaledHeight.roundToInt()),
         )
 
-        val blurStrokes = (strokes + listOfNotNull(currentStroke)).filter { it.tool == EditTool.BLUR }
-        if (blurSource != null && blurStrokes.isNotEmpty()) {
+        val hasBlurStrokes = strokes.any { it.tool == EditTool.BLUR } || currentStroke?.tool == EditTool.BLUR
+        if (blurSource != null && hasBlurStrokes) {
             drawContext.canvas.saveLayer(bounds, androidx.compose.ui.graphics.Paint())
             clipRect(bounds.left, bounds.top, bounds.right, bounds.bottom) {
-                blurStrokes.forEach { drawBlurMask(it, bounds) }
+                strokes.forEach { stroke ->
+                    if (stroke.tool == EditTool.BLUR) {
+                        drawBlurMask(stroke, bounds, strokePathCache.path(stroke, bounds))
+                    }
+                }
+                currentStroke?.takeIf { it.tool == EditTool.BLUR }?.let { drawBlurMask(it, bounds) }
                 drawImage(
                     image = blurSource.asImageBitmap(),
                     dstOffset = IntOffset(left.roundToInt(), top.roundToInt()),
@@ -667,18 +793,39 @@ private fun EditorCanvas(
             drawContext.canvas.restore()
         }
 
-        drawContext.canvas.saveLayer(bounds, androidx.compose.ui.graphics.Paint())
-        clipRect(bounds.left, bounds.top, bounds.right, bounds.bottom) {
-            (strokes + listOfNotNull(currentStroke))
-                .filter { it.tool != EditTool.BLUR }
-                .forEach { drawEditStroke(it, bounds) }
+        val hasAnnotationStrokes = strokes.any { it.tool != EditTool.BLUR } ||
+            currentStroke?.tool?.let { it != EditTool.BLUR } == true
+        if (hasAnnotationStrokes) {
+            drawContext.canvas.saveLayer(bounds, androidx.compose.ui.graphics.Paint())
+            clipRect(bounds.left, bounds.top, bounds.right, bounds.bottom) {
+                strokes.forEach { stroke ->
+                    if (stroke.tool != EditTool.BLUR) {
+                        drawEditStroke(stroke, bounds, strokePathCache.path(stroke, bounds))
+                    }
+                }
+                currentStroke?.takeIf { it.tool != EditTool.BLUR }?.let { drawEditStroke(it, bounds) }
+            }
+            drawContext.canvas.restore()
         }
-        drawContext.canvas.restore()
         if (cropMode) drawCropOverlay(bounds, cropRect)
     }
 }
 
-private fun androidx.compose.ui.graphics.drawscope.DrawScope.drawEditStroke(stroke: EditStroke, bounds: Rect) {
+private fun EditStroke.toPath(bounds: Rect): Path = Path().apply {
+    if (points.isEmpty()) return@apply
+    val first = points.first().fromNormalized(bounds)
+    moveTo(first.x, first.y)
+    points.drop(1).forEach {
+        val point = it.fromNormalized(bounds)
+        lineTo(point.x, point.y)
+    }
+}
+
+private fun androidx.compose.ui.graphics.drawscope.DrawScope.drawEditStroke(
+    stroke: EditStroke,
+    bounds: Rect,
+    cachedPath: Path? = null,
+) {
     if (stroke.points.isEmpty()) return
     if (stroke.points.size == 1) {
         drawCircle(
@@ -690,16 +837,8 @@ private fun androidx.compose.ui.graphics.drawscope.DrawScope.drawEditStroke(stro
         )
         return
     }
-    val path = Path().apply {
-        val first = stroke.points.first().fromNormalized(bounds)
-        moveTo(first.x, first.y)
-        stroke.points.drop(1).forEach {
-            val point = it.fromNormalized(bounds)
-            lineTo(point.x, point.y)
-        }
-    }
     drawPath(
-        path = path,
+        path = cachedPath ?: stroke.toPath(bounds),
         color = if (stroke.tool == EditTool.ERASER) Color.Transparent else stroke.color,
         alpha = if (stroke.tool == EditTool.MARKER) .38f else 1f,
         style = Stroke(width = stroke.width * min(bounds.width, bounds.height), cap = StrokeCap.Round),
@@ -707,7 +846,11 @@ private fun androidx.compose.ui.graphics.drawscope.DrawScope.drawEditStroke(stro
     )
 }
 
-private fun androidx.compose.ui.graphics.drawscope.DrawScope.drawBlurMask(stroke: EditStroke, bounds: Rect) {
+private fun androidx.compose.ui.graphics.drawscope.DrawScope.drawBlurMask(
+    stroke: EditStroke,
+    bounds: Rect,
+    cachedPath: Path? = null,
+) {
     if (stroke.points.isEmpty()) return
     val strokeWidth = stroke.width * min(bounds.width, bounds.height)
     if (stroke.points.size == 1) {
@@ -718,16 +861,8 @@ private fun androidx.compose.ui.graphics.drawscope.DrawScope.drawBlurMask(stroke
         )
         return
     }
-    val path = Path().apply {
-        val first = stroke.points.first().fromNormalized(bounds)
-        moveTo(first.x, first.y)
-        stroke.points.drop(1).forEach {
-            val point = it.fromNormalized(bounds)
-            lineTo(point.x, point.y)
-        }
-    }
     drawPath(
-        path = path,
+        path = cachedPath ?: stroke.toPath(bounds),
         color = Color.White,
         style = Stroke(width = strokeWidth, cap = StrokeCap.Round),
     )
@@ -828,24 +963,65 @@ private fun loadBitmap(context: Context, photo: Photo): Bitmap {
         val source = ImageDecoder.createSource(context.contentResolver, photo.uri)
         ImageDecoder.decodeBitmap(source) { decoder, info, _ ->
             val maxSide = max(info.size.width, info.size.height)
-            if (maxSide > 4096) decoder.setTargetSampleSize((maxSide / 4096f).roundToInt().coerceAtLeast(1))
+            if (maxSide > 4096) decoder.setTargetSampleSize(ceil(maxSide / 4096f).toInt())
             decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
         }
     } else {
+        val orientation = runCatching {
+            context.contentResolver.openInputStream(photo.uri)?.use { input ->
+                ExifInterface(input).getAttributeInt(
+                    ExifInterface.TAG_ORIENTATION,
+                    ExifInterface.ORIENTATION_NORMAL,
+                )
+            } ?: ExifInterface.ORIENTATION_NORMAL
+        }.getOrDefault(ExifInterface.ORIENTATION_NORMAL)
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         context.contentResolver.openInputStream(photo.uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
         var sample = 1
         while (max(bounds.outWidth, bounds.outHeight) / sample > 4096) sample *= 2
-        context.contentResolver.openInputStream(photo.uri)?.use {
+        val decoded = context.contentResolver.openInputStream(photo.uri)?.use {
             BitmapFactory.decodeStream(it, null, BitmapFactory.Options().apply { inSampleSize = sample })
         } ?: error("無法解碼圖片")
+        applyExifOrientation(decoded, orientation)
+    }
+}
+
+private fun applyExifOrientation(source: Bitmap, orientation: Int): Bitmap {
+    val matrix = Matrix()
+    when (orientation) {
+        ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> matrix.setScale(-1f, 1f)
+        ExifInterface.ORIENTATION_ROTATE_180 -> matrix.setRotate(180f)
+        ExifInterface.ORIENTATION_FLIP_VERTICAL -> {
+            matrix.setRotate(180f)
+            matrix.postScale(-1f, 1f)
+        }
+        ExifInterface.ORIENTATION_TRANSPOSE -> {
+            matrix.setRotate(90f)
+            matrix.postScale(-1f, 1f)
+        }
+        ExifInterface.ORIENTATION_ROTATE_90 -> matrix.setRotate(90f)
+        ExifInterface.ORIENTATION_TRANSVERSE -> {
+            matrix.setRotate(-90f)
+            matrix.postScale(-1f, 1f)
+        }
+        ExifInterface.ORIENTATION_ROTATE_270 -> matrix.setRotate(-90f)
+        else -> return source
+    }
+    return try {
+        Bitmap.createBitmap(source, 0, 0, source.width, source.height, matrix, true).also {
+            if (it !== source) source.recycle()
+        }
+    } catch (error: Throwable) {
+        source.recycle()
+        throw error
     }
 }
 
 private fun createBlurSource(source: Bitmap): Bitmap {
     val width = (source.width / 12).coerceAtLeast(1)
     val height = (source.height / 12).coerceAtLeast(1)
-    return Bitmap.createScaledBitmap(source, width, height, true)
+    val scaled = Bitmap.createScaledBitmap(source, width, height, true)
+    return if (scaled === source) source.copy(Bitmap.Config.ARGB_8888, false) else scaled
 }
 
 private fun renderBitmap(source: Bitmap, strokes: List<EditStroke>, preparedBlurSource: Bitmap?): Bitmap {
@@ -853,69 +1029,72 @@ private fun renderBitmap(source: Bitmap, strokes: List<EditStroke>, preparedBlur
     if (strokes.isEmpty()) return base
     val blurStrokes = strokes.filter { it.tool == EditTool.BLUR }
     if (blurStrokes.isNotEmpty()) {
+        val ownsBlur = preparedBlurSource == null
         val blur = preparedBlurSource ?: createBlurSource(source)
-        val shader = BitmapShader(blur, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP).apply {
-            setLocalMatrix(Matrix().apply {
-                setScale(source.width / blur.width.toFloat(), source.height / blur.height.toFloat())
-            })
-        }
-        val canvas = android.graphics.Canvas(base)
-        blurStrokes.forEach { stroke ->
-            val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG).apply {
-                this.shader = shader
-                strokeWidth = stroke.width * min(base.width, base.height)
-                style = Paint.Style.STROKE
-                strokeCap = Paint.Cap.ROUND
-                strokeJoin = Paint.Join.ROUND
+        try {
+            val shader = BitmapShader(blur, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP).apply {
+                setLocalMatrix(Matrix().apply {
+                    setScale(source.width / blur.width.toFloat(), source.height / blur.height.toFloat())
+                })
             }
-            val first = stroke.points.firstOrNull() ?: return@forEach
-            if (stroke.points.size == 1) {
-                paint.style = Paint.Style.FILL
-                canvas.drawCircle(
-                    first.x * base.width,
-                    first.y * base.height,
-                    paint.strokeWidth / 2f,
-                    paint,
-                )
-            } else {
-                val path = android.graphics.Path().apply {
-                    moveTo(first.x * base.width, first.y * base.height)
-                    stroke.points.drop(1).forEach { lineTo(it.x * base.width, it.y * base.height) }
+            val canvas = android.graphics.Canvas(base)
+            blurStrokes.forEach { stroke ->
+                val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG).apply {
+                    this.shader = shader
+                    strokeWidth = stroke.width * min(base.width, base.height)
+                    style = Paint.Style.STROKE
+                    strokeCap = Paint.Cap.ROUND
+                    strokeJoin = Paint.Join.ROUND
                 }
-                canvas.drawPath(path, paint)
+                val first = stroke.points.firstOrNull() ?: return@forEach
+                if (stroke.points.size == 1) {
+                    paint.style = Paint.Style.FILL
+                    canvas.drawCircle(first.x * base.width, first.y * base.height, paint.strokeWidth / 2f, paint)
+                } else {
+                    val path = android.graphics.Path().apply {
+                        moveTo(first.x * base.width, first.y * base.height)
+                        stroke.points.drop(1).forEach { lineTo(it.x * base.width, it.y * base.height) }
+                    }
+                    canvas.drawPath(path, paint)
+                }
             }
+        } finally {
+            if (ownsBlur) blur.recycle()
         }
     }
 
     val annotationStrokes = strokes.filter { it.tool != EditTool.BLUR }
     if (annotationStrokes.isEmpty()) return base
     val overlay = Bitmap.createBitmap(base.width, base.height, Bitmap.Config.ARGB_8888)
-    val canvas = android.graphics.Canvas(overlay)
-    annotationStrokes.forEach { stroke ->
-        if (stroke.points.isEmpty()) return@forEach
-        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = stroke.color.toArgb()
-            alpha = if (stroke.tool == EditTool.MARKER) 97 else 255
-            strokeWidth = stroke.width * min(base.width, base.height)
-            style = Paint.Style.STROKE
-            strokeCap = Paint.Cap.ROUND
-            strokeJoin = Paint.Join.ROUND
-            if (stroke.tool == EditTool.ERASER) xfermode = PorterDuffXfermode(PorterDuff.Mode.CLEAR)
+    try {
+        val canvas = android.graphics.Canvas(overlay)
+        annotationStrokes.forEach { stroke ->
+            if (stroke.points.isEmpty()) return@forEach
+            val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = stroke.color.toArgb()
+                alpha = if (stroke.tool == EditTool.MARKER) 97 else 255
+                strokeWidth = stroke.width * min(base.width, base.height)
+                style = Paint.Style.STROKE
+                strokeCap = Paint.Cap.ROUND
+                strokeJoin = Paint.Join.ROUND
+                if (stroke.tool == EditTool.ERASER) xfermode = PorterDuffXfermode(PorterDuff.Mode.CLEAR)
+            }
+            val path = android.graphics.Path().apply {
+                moveTo(stroke.points.first().x * base.width, stroke.points.first().y * base.height)
+                stroke.points.drop(1).forEach { lineTo(it.x * base.width, it.y * base.height) }
+            }
+            if (stroke.points.size == 1) {
+                val point = stroke.points.first()
+                paint.style = Paint.Style.FILL
+                canvas.drawCircle(point.x * base.width, point.y * base.height, paint.strokeWidth / 2f, paint)
+            } else {
+                canvas.drawPath(path, paint)
+            }
         }
-        val path = android.graphics.Path().apply {
-            moveTo(stroke.points.first().x * base.width, stroke.points.first().y * base.height)
-            stroke.points.drop(1).forEach { lineTo(it.x * base.width, it.y * base.height) }
-        }
-        if (stroke.points.size == 1) {
-            val point = stroke.points.first()
-            paint.style = Paint.Style.FILL
-            canvas.drawCircle(point.x * base.width, point.y * base.height, paint.strokeWidth / 2f, paint)
-        } else {
-            canvas.drawPath(path, paint)
-        }
+        android.graphics.Canvas(base).drawBitmap(overlay, 0f, 0f, null)
+    } finally {
+        overlay.recycle()
     }
-    android.graphics.Canvas(base).drawBitmap(overlay, 0f, 0f, null)
-    overlay.recycle()
     return base
 }
 

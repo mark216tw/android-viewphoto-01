@@ -1,9 +1,12 @@
 package com.miniphoto.viewer.ui
 
 import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.calculateCentroid
+import androidx.compose.foundation.gestures.calculatePan
+import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.gestures.detectTapGestures
-import androidx.compose.foundation.gestures.rememberTransformableState
-import androidx.compose.foundation.gestures.transformable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
@@ -42,30 +45,86 @@ fun ZoomablePhoto(
 ) {
     var containerSize by remember(photo.id) { mutableStateOf(Size.Zero) }
     val fittedSize = fittedImageSize(photo, containerSize)
-    val scale = viewport.scale.coerceIn(1f, 10f)
+    val scale = viewport.scale.coerceIn(1f, 20f)
     val offset = viewport.toOffset(scale, fittedSize, containerSize)
     val currentScale by rememberUpdatedState(scale)
+    val currentViewport by rememberUpdatedState(viewport)
+    val currentFittedSize by rememberUpdatedState(fittedSize)
+    val currentContainerSize by rememberUpdatedState(containerSize)
     val currentOnTap by rememberUpdatedState(onTap)
     val currentOnViewportChange by rememberUpdatedState(onViewportChange)
-
-    val transformState = rememberTransformableState { zoomChange, panChange, _ ->
-        val nextScale = (scale * zoomChange).coerceIn(1f, 10f)
-        val nextOffset = if (nextScale == 1f) {
-            Offset.Zero
-        } else {
-            constrainOffset(offset + panChange, nextScale, fittedSize, containerSize)
-        }
-        onViewportChange(nextOffset.toViewport(nextScale, fittedSize))
-    }
 
     Box(
         modifier = Modifier
             .fillMaxSize()
             .onSizeChanged { containerSize = Size(it.width.toFloat(), it.height.toFloat()) }
-            .transformable(
-                state = transformState,
-                canPan = { scale > 1f },
-            )
+            .pointerInput(photo.id) {
+                val touchSlop = viewConfiguration.touchSlop
+                awaitEachGesture {
+                    awaitFirstDown(requireUnconsumed = false)
+                    val gestureFittedSize = currentFittedSize
+                    val gestureContainerSize = currentContainerSize
+                    var gestureScale = currentViewport.scale.coerceIn(1f, 20f)
+                    var gestureOffset = currentViewport.toOffset(
+                        gestureScale,
+                        gestureFittedSize,
+                        gestureContainerSize,
+                    )
+                    var transforming = false
+                    var pastTouchSlop = false
+                    var accumulatedPan = Offset.Zero
+
+                    while (true) {
+                        val event = awaitPointerEvent()
+                        val pressed = event.changes.filter { it.pressed }
+                        if (pressed.size >= 2) {
+                            transforming = true
+                            val result = calculateZoomTransform(
+                                oldScale = gestureScale,
+                                oldOffset = gestureOffset,
+                                zoomChange = event.calculateZoom(),
+                                panChange = event.calculatePan(),
+                                centroid = event.calculateCentroid(),
+                                fitted = gestureFittedSize,
+                                container = gestureContainerSize,
+                            )
+                            gestureScale = result.scale
+                            gestureOffset = result.offset
+                            currentOnViewportChange(gestureOffset.toViewport(gestureScale, gestureFittedSize))
+                            event.changes.forEach { it.consume() }
+                        } else if (pressed.size == 1 && (transforming || gestureScale > 1f)) {
+                            val panChange = event.calculatePan()
+                            if (transforming || pastTouchSlop) {
+                                gestureOffset = constrainOffset(
+                                    gestureOffset + panChange,
+                                    gestureScale,
+                                    gestureFittedSize,
+                                    gestureContainerSize,
+                                )
+                                currentOnViewportChange(gestureOffset.toViewport(gestureScale, gestureFittedSize))
+                                event.changes.forEach { it.consume() }
+                            } else {
+                                accumulatedPan += panChange
+                                if (accumulatedPan.getDistance() > touchSlop) {
+                                    pastTouchSlop = true
+                                    gestureOffset = constrainOffset(
+                                        gestureOffset + accumulatedPan,
+                                        gestureScale,
+                                        gestureFittedSize,
+                                        gestureContainerSize,
+                                    )
+                                    currentOnViewportChange(
+                                        gestureOffset.toViewport(gestureScale, gestureFittedSize)
+                                    )
+                                    event.changes.forEach { it.consume() }
+                                }
+                            }
+                        }
+
+                        if (pressed.isEmpty()) break
+                    }
+                }
+            }
             .pointerInput(photo.id) {
                 detectTapGestures(
                     onTap = { currentOnTap() },
@@ -92,6 +151,33 @@ fun ZoomablePhoto(
     }
 }
 
+internal data class ZoomTransformResult(
+    val scale: Float,
+    val offset: Offset,
+)
+
+internal fun calculateZoomTransform(
+    oldScale: Float,
+    oldOffset: Offset,
+    zoomChange: Float,
+    panChange: Offset,
+    centroid: Offset,
+    fitted: Size,
+    container: Size,
+): ZoomTransformResult {
+    val nextScale = (oldScale * zoomChange).coerceIn(1f, 20f)
+    if (nextScale == 1f) return ZoomTransformResult(1f, Offset.Zero)
+    val appliedZoom = nextScale / oldScale
+    val viewportCenter = Offset(container.width / 2f, container.height / 2f)
+    val centroidOffset = centroid - viewportCenter
+    val candidate = oldOffset * appliedZoom +
+        centroidOffset * (1f - appliedZoom) + panChange
+    return ZoomTransformResult(
+        scale = nextScale,
+        offset = constrainOffset(candidate, nextScale, fitted, container),
+    )
+}
+
 private fun fittedImageSize(photo: Photo, container: Size): Size {
     if (container == Size.Zero || photo.width <= 0 || photo.height <= 0) return container
     val fitScale = min(container.width / photo.width, container.height / photo.height)
@@ -116,7 +202,7 @@ private fun Offset.toViewport(scale: Float, fitted: Size): PhotoViewport {
     )
 }
 
-private fun constrainOffset(offset: Offset, scale: Float, fitted: Size, container: Size): Offset {
+internal fun constrainOffset(offset: Offset, scale: Float, fitted: Size, container: Size): Offset {
     val maxX = max(0f, (fitted.width * scale - container.width) / 2f)
     val maxY = max(0f, (fitted.height * scale - container.height) / 2f)
     return Offset(offset.x.coerceIn(-maxX, maxX), offset.y.coerceIn(-maxY, maxY))
