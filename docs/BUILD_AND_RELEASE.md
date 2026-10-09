@@ -57,7 +57,7 @@ apksigner verify --verbose --print-certs app/build/outputs/apk/prerelease/app-pr
 2. 相片與資料夾載入。
 3. 雙擊縮放、手勢縮放與圖片切換。
 4. 所有編輯工具、復原、重做、旋轉、翻轉及裁切。
-5. 一般儲存、分享、刪除與外部 `EDIT` Intent。
+5. 一般儲存、分享、刪除，以及外部 `VIEW`、`EDIT` 與單張圖片 `SEND` Intent。
 6. 淺色及深色模式。
 7. 照片瀏覽控制列與系統列顯示／隱藏。
 8. 大型圖庫分頁載入、日期排序與刪除後照片位置。

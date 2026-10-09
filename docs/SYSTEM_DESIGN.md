@@ -50,10 +50,11 @@ stateDiagram-v2
     Editor --> Viewer: 取消編輯
     Editor --> Gallery: 儲存完成
     ExternalView --> Viewer: ACTION_VIEW
+    ExternalShare --> Viewer: ACTION_SEND
     ExternalEdit --> Editor: ACTION_EDIT
 ```
 
-`GalleryApp` 使用 sealed interface 表示畫面，避免引入額外 Navigation 依賴。外部圖片另以 `returnToExternal` 與 `directExternalEdit` 控制返回目的地。
+`GalleryApp` 使用 sealed interface 表示畫面，避免引入額外 Navigation 依賴。單張圖片分享會沿用外部瀏覽流程；外部圖片另以 `returnToExternal` 與 `directExternalEdit` 控制返回目的地。
 
 ## 編輯狀態設計
 

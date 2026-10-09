@@ -36,26 +36,23 @@ flowchart TD
 
 - Edge-to-edge 視窗與主題套用。
 - Android 圖片權限要求。
-- 接收 `ACTION_VIEW` 與 `ACTION_EDIT`。
+- 接收 `ACTION_VIEW`、`ACTION_EDIT` 與單張圖片 `ACTION_SEND`。
 - 啟動系統分享及刪除確認流程。
 
 ### 狀態層
 
 `MainViewModel` 管理：
 
-- `GalleryUiState`：圖片清單、載入及錯誤狀態。
 - `GalleryUiState`：圖片分頁、載入更多、錯誤與 MediaStore 變更狀態。
-- 外部圖片開啟要求與 `VIEW`／`EDIT` 模式。
+- 外部圖片開啟要求與 `VIEW`／`EDIT` 模式；`SEND` 使用瀏覽模式。
 - 顯示模式，並透過 SharedPreferences 保存。
 
 ### 資料層
 
 `PhotoRepository` 封裝：
 
-- MediaStore 圖片查詢及排序。
 - MediaStore 分頁查詢、穩定日期排序與 ContentObserver 刷新。
 - 外部 `content://` URI 中繼資料解析。
-- JPEG 輸出至公開 Pictures 目錄。
 - 依 Bitmap alpha 狀態輸出 PNG 或 JPEG。
 - 分享暫存檔與 FileProvider URI。
 

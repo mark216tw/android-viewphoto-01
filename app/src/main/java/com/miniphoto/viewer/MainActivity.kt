@@ -24,8 +24,9 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalView
-import androidx.core.content.ContextCompat
 import androidx.annotation.RequiresApi
+import androidx.core.content.ContextCompat
+import androidx.core.content.IntentCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -43,7 +44,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        handleViewIntent(intent)
+        handleExternalIntent(intent)
         setContent {
             val displayMode by viewModel.displayMode.collectAsStateWithLifecycle()
             val systemDark = isSystemInDarkTheme()
@@ -157,16 +158,23 @@ class MainActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
-        handleViewIntent(intent)
+        handleExternalIntent(intent)
     }
 
-    private fun handleViewIntent(intent: Intent?) {
+    private fun handleExternalIntent(intent: Intent?) {
         val mode = when (intent?.action) {
             Intent.ACTION_VIEW -> ExternalOpenMode.VIEW
             Intent.ACTION_EDIT -> ExternalOpenMode.EDIT
+            Intent.ACTION_SEND -> ExternalOpenMode.VIEW
             else -> return
         }
-        intent.data?.let { viewModel.openExternalPhoto(it, mode) }
+        val uri = if (intent.action == Intent.ACTION_SEND) {
+            IntentCompat.getParcelableExtra(intent, Intent.EXTRA_STREAM, Uri::class.java)
+                ?: intent.clipData?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.uri
+        } else {
+            intent.data
+        }
+        uri?.let { viewModel.openExternalPhoto(it, mode) }
     }
 
     private fun finishExternal() {
