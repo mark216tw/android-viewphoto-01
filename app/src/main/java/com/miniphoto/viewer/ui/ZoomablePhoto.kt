@@ -29,6 +29,8 @@ import com.miniphoto.viewer.data.Photo
 import kotlin.math.max
 import kotlin.math.min
 
+internal const val MAX_PHOTO_SCALE = 30f
+
 data class PhotoViewport(
     val scale: Float = 1f,
     val centerX: Float = .5f,
@@ -44,8 +46,11 @@ fun ZoomablePhoto(
     onTap: () -> Unit,
 ) {
     var containerSize by remember(photo.id) { mutableStateOf(Size.Zero) }
-    val fittedSize = fittedImageSize(photo, containerSize)
-    val scale = viewport.scale.coerceIn(1f, 20f)
+    var imageSize by remember(photo.id) {
+        mutableStateOf(Size(photo.width.toFloat(), photo.height.toFloat()))
+    }
+    val fittedSize = fittedImageSize(imageSize, containerSize)
+    val scale = viewport.scale.coerceIn(1f, MAX_PHOTO_SCALE)
     val offset = viewport.toOffset(scale, fittedSize, containerSize)
     val currentScale by rememberUpdatedState(scale)
     val currentViewport by rememberUpdatedState(viewport)
@@ -64,7 +69,7 @@ fun ZoomablePhoto(
                     awaitFirstDown(requireUnconsumed = false)
                     val gestureFittedSize = currentFittedSize
                     val gestureContainerSize = currentContainerSize
-                    var gestureScale = currentViewport.scale.coerceIn(1f, 20f)
+                    var gestureScale = currentViewport.scale.coerceIn(1f, MAX_PHOTO_SCALE)
                     var gestureOffset = currentViewport.toOffset(
                         gestureScale,
                         gestureFittedSize,
@@ -141,6 +146,14 @@ fun ZoomablePhoto(
             model = photo.uri,
             contentDescription = photo.name,
             contentScale = ContentScale.Fit,
+            onSuccess = { state ->
+                val decodedSize = state.painter.intrinsicSize
+                if (decodedSize.width.isFinite() && decodedSize.width > 0f &&
+                    decodedSize.height.isFinite() && decodedSize.height > 0f
+                ) {
+                    imageSize = decodedSize
+                }
+            },
             modifier = Modifier.fillMaxSize().graphicsLayer {
                 scaleX = scale
                 scaleY = scale
@@ -165,7 +178,7 @@ internal fun calculateZoomTransform(
     fitted: Size,
     container: Size,
 ): ZoomTransformResult {
-    val nextScale = (oldScale * zoomChange).coerceIn(1f, 20f)
+    val nextScale = (oldScale * zoomChange).coerceIn(1f, MAX_PHOTO_SCALE)
     if (nextScale == 1f) return ZoomTransformResult(1f, Offset.Zero)
     val appliedZoom = nextScale / oldScale
     val viewportCenter = Offset(container.width / 2f, container.height / 2f)
@@ -178,10 +191,10 @@ internal fun calculateZoomTransform(
     )
 }
 
-private fun fittedImageSize(photo: Photo, container: Size): Size {
-    if (container == Size.Zero || photo.width <= 0 || photo.height <= 0) return container
-    val fitScale = min(container.width / photo.width, container.height / photo.height)
-    return Size(photo.width * fitScale, photo.height * fitScale)
+internal fun fittedImageSize(image: Size, container: Size): Size {
+    if (container == Size.Zero || image.width <= 0f || image.height <= 0f) return container
+    val fitScale = min(container.width / image.width, container.height / image.height)
+    return Size(image.width * fitScale, image.height * fitScale)
 }
 
 fun PhotoViewport.toOffset(scale: Float, fitted: Size, container: Size): Offset {

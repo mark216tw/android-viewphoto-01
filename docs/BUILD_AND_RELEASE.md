@@ -25,7 +25,7 @@ java -version
 
 ### prerelease
 
-供測試發行，版本名稱為 `1.0.0-prerelease`，啟用 R8 程式碼壓縮與資源縮減，並使用 Debug 金鑰簽署。
+供測試發行，目前版本名稱為 `1.0.2-prerelease`，啟用 R8 程式碼壓縮與資源縮減，並使用 Debug 金鑰簽署。
 
 ```powershell
 .\gradlew.bat clean assemblePrerelease
@@ -67,13 +67,13 @@ apksigner verify --verbose --print-certs app/build/outputs/apk/prerelease/app-pr
 建議標籤格式：
 
 ```text
-v1.0.0-prerelease
+v1.0.2-prerelease
 ```
 
 使用 GitHub CLI：
 
 ```powershell
-gh release create v1.0.0-prerelease app/build/outputs/apk/prerelease/app-prerelease.apk --prerelease --title "1.0.0-prerelease" --notes "Pre-release 版本"
+gh release create v1.0.2-prerelease app/build/outputs/apk/prerelease/app-prerelease.apk --prerelease --title "1.0.2-prerelease" --notes-file RELEASE_NOTES.md
 ```
 
 建立前建議先產生最新 APK：

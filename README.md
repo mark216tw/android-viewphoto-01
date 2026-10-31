@@ -6,7 +6,7 @@
 
 - 依時間瀏覽裝置相片，或依資料夾分類檢視。
 - 單擊切換瀏覽控制列，雙擊放大或還原，雙指縮放與拖曳。
-- 照片瀏覽最大放大 20 倍，縮放時以雙指中心為定位點。
+- 照片瀏覽最大放大 30 倍，縮放時以雙指中心為定位點。
 - 照片瀏覽控制列隱藏時，同步進入沉浸式全螢幕瀏覽。
 - 支援 Android 圖片 `VIEW`、`EDIT` 與單張圖片分享 Intent，可由其他 App 的開啟、編輯或分享選單啟動。
 - 畫筆、螢光筆、橡皮擦與模糊工具使用一致的固定螢幕粗細。
@@ -62,6 +62,7 @@ app/build/outputs/apk/prerelease/app-prerelease.apk
 - [系統設計文件](docs/SYSTEM_DESIGN.md)
 - [建置與發行指南](docs/BUILD_AND_RELEASE.md)
 - [變更紀錄](CHANGELOG.md)
+- [發行說明](RELEASE_NOTES.md)
 
 ## 專案結構
 

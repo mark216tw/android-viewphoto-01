@@ -46,8 +46,8 @@ class ZoomTransformTest {
     @Test
     fun `zoom uses clamped applied ratio at maximum`() {
         val result = calculateZoomTransform(
-            oldScale = 19f,
-            oldOffset = Offset(190f, 0f),
+            oldScale = 29f,
+            oldOffset = Offset(290f, 0f),
             zoomChange = 2f,
             panChange = Offset.Zero,
             centroid = Offset(500f, 500f),
@@ -55,8 +55,8 @@ class ZoomTransformTest {
             container = container,
         )
 
-        assertEquals(20f, result.scale, .001f)
-        assertEquals(200f, result.offset.x, .001f)
+        assertEquals(30f, result.scale, .001f)
+        assertEquals(300f, result.offset.x, .001f)
     }
 
     @Test
@@ -73,5 +73,21 @@ class ZoomTransformTest {
 
         assertEquals(1f, result.scale, .001f)
         assertEquals(Offset.Zero, result.offset)
+    }
+
+    @Test
+    fun `decoded portrait dimensions allow panning to both vertical edges`() {
+        val portrait = fittedImageSize(
+            image = Size(3_000f, 4_000f),
+            container = container,
+        )
+
+        val top = constrainOffset(Offset(0f, Float.MAX_VALUE), 2f, portrait, container)
+        val bottom = constrainOffset(Offset(0f, -Float.MAX_VALUE), 2f, portrait, container)
+
+        assertEquals(750f, portrait.width, .001f)
+        assertEquals(1_000f, portrait.height, .001f)
+        assertEquals(500f, top.y, .001f)
+        assertEquals(-500f, bottom.y, .001f)
     }
 }

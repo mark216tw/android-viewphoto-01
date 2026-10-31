@@ -643,7 +643,7 @@ private fun EditorCanvas(
             panOffset = Offset.Zero
             viewportInitialized = true
         } else if (!viewportInitialized && viewportSize != Size.Zero && fittedImageSize != Size.Zero) {
-            val scale = initialViewport.scale.coerceIn(1f, 20f)
+            val scale = initialViewport.scale.coerceIn(1f, MAX_PHOTO_SCALE)
             zoomScale = scale
             panOffset = initialViewport.toOffset(scale, fittedImageSize, viewportSize)
             viewportInitialized = true
@@ -696,7 +696,7 @@ private fun EditorCanvas(
                                 cancelStroke()
                             }
                             val oldScale = zoomScale
-                            val nextScale = (oldScale * event.calculateZoom()).coerceIn(1f, 20f)
+                            val nextScale = (oldScale * event.calculateZoom()).coerceIn(1f, MAX_PHOTO_SCALE)
                             if (nextScale == 1f) {
                                 panOffset = Offset.Zero
                             } else if (viewportSize != Size.Zero && fittedImageSize != Size.Zero) {
