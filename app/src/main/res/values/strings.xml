@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="widget_name">相片小工具</string>
+    <string name="widget_description">以 2x2 顯示相片，可調整大小、左右切換與重新整理。</string>
+    <string name="widget_photo_content_description">相片：%1$s</string>
+    <string name="widget_photo_content_description_default">相片小工具預覽</string>
+    <string name="widget_previous">上一張相片</string>
+    <string name="widget_next">下一張相片</string>
+    <string name="widget_refresh">重新整理並回到第一張相片</string>
+    <string name="widget_loading">正在載入相片…</string>
+    <string name="widget_empty">尚無相片</string>
+    <string name="widget_permission_required">開啟 App 並授予相片存取權限</string>
+    <string name="widget_load_error">無法讀取相片</string>
+</resources>

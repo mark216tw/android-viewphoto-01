@@ -13,6 +13,7 @@
 - 記住各工具粗細，以及畫筆與螢光筆最後使用的顏色。
 - 支援復原、重做、裁切、旋轉、水平翻轉、分享及另存 JPEG。
 - 支援淺色、深色及跟隨系統外觀。
+- 主畫面 2x2 相片小工具，可調整大小、切換相片及重新整理；控制圖示閒置時自動隱藏。
 - 圖庫以分頁方式載入，並監聽 MediaStore 變更自動刷新。
 - 依拍攝日期排序，沒有拍攝日期時改用加入媒體庫日期。
 - 圖片只在裝置本機處理，不會上傳到遠端服務。
@@ -73,12 +74,23 @@ app/src/main/java/com/miniphoto/viewer/
 |-- data/
 |   |-- Photo.kt
 |   `-- PhotoRepository.kt
+|-- util/
+|   `-- MediaPermissions.kt
+|-- widget/
+|   |-- PhotoWidgetLogic.kt
+|   |-- PhotoWidgetProvider.kt
+|   |-- PhotoWidgetStateStore.kt
+|   `-- PhotoWidgetUpdater.kt
 `-- ui/
     |-- GalleryApp.kt
     |-- PhotoEditorScreen.kt
     |-- ZoomablePhoto.kt
     `-- theme/Theme.kt
 ```
+
+## 桌面相片小工具
+
+在主畫面新增「相片小工具」後，會以 2x2 顯示最近相片。長按小工具拖曳邊框可調整大小來放大相片。底部控制圖示平時隱藏，點擊小工具底部區域才會顯示；顯示後可切換上一張／下一張，重新整理會重新讀取相片並回到第一張，4 秒未操作會自動隱藏。點擊相片可開啟 App；若尚未授權，點擊小工具會開啟 App 以完成授權。
 
 ## 隱私與權限
 

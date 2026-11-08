@@ -34,6 +34,8 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.lifecycleScope
 import com.miniphoto.viewer.ui.GalleryApp
 import com.miniphoto.viewer.ui.theme.MiniPhotoTheme
+import com.miniphoto.viewer.util.hasImageReadPermission
+import com.miniphoto.viewer.widget.PhotoWidgetUpdater
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.launch
 
@@ -87,6 +89,7 @@ class MainActivity : ComponentActivity() {
                     val granted = hasImagePermission()
                     viewModel.setImagePermission(granted)
                     if (granted) viewModel.refresh()
+                    PhotoWidgetUpdater.requestUpdate(this@MainActivity)
                 }
                 val writePermissionLauncher = rememberLauncherForActivityResult(
                     ActivityResultContracts.RequestPermission()
@@ -153,6 +156,7 @@ class MainActivity : ComponentActivity() {
         viewModel.setImagePermission(granted)
         viewModel.setWritePermission(hasWritePermission())
         if (granted) viewModel.refresh()
+        PhotoWidgetUpdater.requestUpdate(this)
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -190,12 +194,6 @@ class MainActivity : ComponentActivity() {
         finish()
     }
 
-    private fun imagePermission(): String = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-        Manifest.permission.READ_MEDIA_IMAGES
-    } else {
-        Manifest.permission.READ_EXTERNAL_STORAGE
-    }
-
     private fun requiredPermissions(): Array<String> = when {
         Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE -> arrayOf(
             Manifest.permission.READ_MEDIA_IMAGES,
@@ -206,16 +204,7 @@ class MainActivity : ComponentActivity() {
         else -> arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE)
     }
 
-    private fun hasImagePermission(): Boolean {
-        val fullAccess = ContextCompat.checkSelfPermission(this, imagePermission()) ==
-            PackageManager.PERMISSION_GRANTED
-        val selectedAccess = Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE &&
-            ContextCompat.checkSelfPermission(
-                this,
-                Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED,
-            ) == PackageManager.PERMISSION_GRANTED
-        return fullAccess || selectedAccess
-    }
+    private fun hasImagePermission(): Boolean = hasImageReadPermission()
 
     private fun hasWritePermission(): Boolean = Build.VERSION.SDK_INT > Build.VERSION_CODES.P ||
         ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE) ==

@@ -28,6 +28,11 @@ flowchart TD
     D --> H[MediaStore]
     D --> I[ContentResolver]
     D --> J[FileProvider Cache]
+    K[PhotoWidgetProvider] --> D
+    K --> L[PhotoWidgetStateStore]
+    K --> M[RemoteViews]
+    A --> N[PhotoWidgetUpdater]
+    N --> K
 ```
 
 ### Activity 層
@@ -55,6 +60,15 @@ flowchart TD
 - 外部 `content://` URI 中繼資料解析。
 - 依 Bitmap alpha 狀態輸出 PNG 或 JPEG。
 - 分享暫存檔與 FileProvider URI。
+
+### 小工具層
+
+- `PhotoWidgetProvider`：接收系統更新與上一張／下一張／重新整理廣播，使用 `goAsync` 在背景查詢 MediaStore 並更新 `RemoteViews`。
+- `PhotoWidgetStateStore`：以 SharedPreferences 依 `appWidgetId` 保存相片索引與控制圖示顯示狀態。
+- `PhotoWidgetLogic`：索引邊界與 Bitmap 取樣計算。
+- `PhotoWidgetUpdater`：App 回到前景或權限變更時通知小工具更新。
+- 控制圖示預設隱藏，點擊底部區域後顯示，並以 Handler 在 4 秒後送出隱藏廣播。
+- `util/MediaPermissions.kt`：Activity 與小工具共用的相片權限判斷。
 
 ### UI 層
 
@@ -95,8 +109,18 @@ flowchart TD
 - API 29 刪除使用 `RecoverableSecurityException`。
 - API 30 以上刪除使用 `MediaStore.createDeleteRequest`。
 
+## 小工具圖片管線
+
+1. 以小工具目前尺寸計算目標長邊，上限 512px。
+2. 以 `BitmapFactory` 讀取 bounds 後計算 `inSampleSize`，使用 RGB_565 降低記憶體用量。
+3. 依 EXIF orientation 旋轉或翻轉，再縮放至上限尺寸。
+4. 以 `RemoteViews.setImageViewBitmap` 傳給 Launcher，避免超過 Binder 大小限制。
+
 ## 已知技術限制
 
+- 桌面小工具受 `RemoteViews` 限制，不支援雙指縮放、任意手勢拖曳與 Compose `HorizontalPager`；改以調整尺寸與左右按鈕操作。
+- 控制圖示自動隱藏依賴 App 程序存活，程序被系統回收時可能延後隱藏。
+- 小工具僅載入最近 500 張相片。
 - 裁切屬於破壞式編輯，套用後無法逐筆復原先前筆畫。
 - 編輯狀態可跨組態變更保存；程序被系統完全終止後不保證恢復完整筆畫。
 - 目前已有圖片排序、編輯狀態、刪除位置與縮放計算單元測試，仍應執行實機回歸測試。
